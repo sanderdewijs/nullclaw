@@ -5336,8 +5336,20 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     }
 
     // Accept loop — read raw HTTP from TCP connections
+    var evict_counter: u32 = 0;
     while (true) {
         if (daemon_mode and daemon.isShutdownRequested()) break;
+
+        // Periodic session eviction (mirrors channel_loop pattern)
+        evict_counter +%= 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            if (session_mgr_opt) |*sm| {
+                if (config_opt) |cfg| {
+                    _ = sm.evictIdle(cfg.agent.session_idle_timeout_secs);
+                }
+            }
+        }
 
         var conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {

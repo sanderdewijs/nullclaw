@@ -860,6 +860,162 @@ pub const CronScheduler = struct {
         }
     }
 
+    /// Non-blocking variant of `tick` for daemon mode.  Executes shell jobs
+    /// inline (they are fast) but returns agent jobs as deferred work items
+    /// so the caller can run them **outside** the scheduler mutex, preventing
+    /// a deadlock when the agent child process calls back into the gateway's
+    /// /cron HTTP endpoints which also need the mutex.
+    ///
+    /// Usage:
+    ///   lock();
+    ///   const deferred = scheduler.tickDeferred(now, bus, allocator);
+    ///   unlock();
+    ///   // execute deferred agent jobs without lock ...
+    ///   lock();
+    ///   scheduler.applyDeferredResults(deferred, now, bus);
+    ///   allocator.free(deferred);
+    ///   unlock();
+    pub fn tickDeferred(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus, ext_allocator: std.mem.Allocator) []DeferredAgentJob {
+        var deferred: std.ArrayListUnmanaged(DeferredAgentJob) = .empty;
+        var remove_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer remove_indices.deinit(self.allocator);
+
+        for (self.jobs.items, 0..) |*job, idx| {
+            if (job.paused or job.next_run_secs > now) continue;
+
+            switch (job.job_type) {
+                .shell => {
+                    const result = std.process.Child.run(.{
+                        .allocator = self.allocator,
+                        .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
+                        .cwd = self.shell_cwd,
+                    }) catch |err| {
+                        log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
+                        job.last_status = "error";
+                        job.last_run_secs = now;
+                        job.last_output = null;
+                        if (out_bus) |b| {
+                            const jn = job.name orelse job.id;
+                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b, jn) catch {};
+                        }
+                        continue;
+                    };
+                    defer self.allocator.free(result.stderr);
+                    const success = switch (result.term) {
+                        .Exited => |code| code == 0,
+                        else => false,
+                    };
+                    job.last_run_secs = now;
+                    job.last_status = if (success) "ok" else "error";
+                    if (job.last_output) |old| self.allocator.free(old);
+                    job.last_output = if (result.stdout.len > 0) result.stdout else blk: {
+                        self.allocator.free(result.stdout);
+                        break :blk null;
+                    };
+                    if (out_bus) |b| {
+                        const output = job.last_output orelse "";
+                        const jn = job.name orelse job.id;
+                        _ = deliverResult(self.allocator, job.delivery, output, success, b, jn) catch {};
+                    }
+                },
+                .agent => {
+                    const agent_output = job.prompt orelse job.command;
+                    if (builtin.is_test) {
+                        job.last_run_secs = now;
+                        job.last_status = "ok";
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, agent_output) catch null;
+                        if (out_bus) |b| {
+                            const jn = job.name orelse job.id;
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, jn) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b, jn) catch {};
+                            }
+                        }
+                    } else {
+                        // Mark as running but defer actual execution
+                        job.last_run_secs = now;
+                        job.last_status = "running";
+                        deferred.append(ext_allocator, .{
+                            .job_idx = idx,
+                            .prompt = agent_output,
+                            .model = job.model,
+                        }) catch {
+                            log.err("cron agent job '{s}': failed to defer", .{job.id});
+                            job.last_status = "error";
+                        };
+                    }
+                },
+            }
+
+            if (job.one_shot or job.delete_after_run) {
+                remove_indices.append(self.allocator, idx) catch {
+                    job.paused = true;
+                };
+            } else {
+                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                    log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
+                    break :blk now + 60;
+                };
+            }
+        }
+
+        if (remove_indices.items.len > 0) {
+            var i: usize = remove_indices.items.len;
+            while (i > 0) {
+                i -= 1;
+                const rm_idx = remove_indices.items[i];
+                const job = self.jobs.items[rm_idx];
+                self.freeJobOwned(job);
+                _ = self.jobs.orderedRemove(rm_idx);
+            }
+        }
+
+        return deferred.toOwnedSlice(ext_allocator) catch &.{};
+    }
+
+    /// Write back results from deferred agent jobs.  Must be called under
+    /// the scheduler mutex after executing the jobs.
+    pub fn applyDeferredResults(self: *CronScheduler, deferred: []DeferredAgentJob, now: i64, out_bus: ?*bus.Bus) void {
+        for (deferred) |*d| {
+            if (d.job_idx >= self.jobs.items.len) continue;
+            const job = &self.jobs.items[d.job_idx];
+
+            if (d.spawn_err) {
+                job.last_status = "error";
+                if (job.last_output) |old| self.allocator.free(old);
+                job.last_output = null;
+                if (out_bus) |b| {
+                    const jn = job.name orelse job.id;
+                    _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b, jn) catch {};
+                }
+                continue;
+            }
+
+            if (d.result) |exec_result| {
+                job.last_run_secs = now;
+                job.last_status = if (exec_result.success) "ok" else "error";
+                if (job.last_output) |old| self.allocator.free(old);
+                if (out_bus) |b| {
+                    const jn = job.name orelse job.id;
+                    if (job.session_target == .main) {
+                        _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, jn) catch {};
+                    } else {
+                        _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b, jn) catch {};
+                    }
+                }
+                job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
+                    self.allocator.free(exec_result.output);
+                    break :blk null;
+                };
+            } else {
+                // No result means job wasn't executed (shouldn't happen)
+                job.last_status = "error";
+            }
+        }
+    }
+
     /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
     /// Separated from `run` for testability.
     pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) bool {
@@ -998,6 +1154,17 @@ pub const CronScheduler = struct {
 pub const AgentRunResult = struct {
     success: bool,
     output: []const u8,
+};
+
+/// A deferred agent job collected by `tickDeferred` to be executed outside
+/// the scheduler mutex.  After execution, call `applyDeferredResults` under
+/// the lock to write results back.
+pub const DeferredAgentJob = struct {
+    job_idx: usize,
+    prompt: []const u8,
+    model: ?[]const u8,
+    result: ?AgentRunResult = null,
+    spawn_err: bool = false,
 };
 
 const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;

@@ -59,6 +59,12 @@ pub const TaskContract = struct {
     skill: []const u8,
 };
 
+pub const CheckpointDetail = struct {
+    description: []const u8,
+    check_type: []const u8,
+    passed: bool,
+};
+
 pub const ContractResult = struct {
     session_id: []const u8,
     timestamp: i64,
@@ -69,7 +75,56 @@ pub const ContractResult = struct {
     checkpoints_total: u8,
     duration_ms: u64,
     verified_at: i64,
+    checkpoint_details: ?[]const CheckpointDetail = null,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pre-filter: skip trivial/noise messages
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Returns true if the user message is too trivial to warrant a contract.
+/// Filters: very short messages, thank-you / acknowledgement messages,
+/// and session startup prompts (which are system-initiated, not real tasks).
+pub fn shouldSkipContract(user_message: []const u8) bool {
+    const trimmed = std.mem.trim(u8, user_message, " \t\r\n");
+
+    // Messages under 15 chars are almost always acknowledgements
+    if (trimmed.len < 15) return true;
+
+    // Session startup prompts (system-generated, not user tasks)
+    if (containsIgnoreCase(trimmed, "session startup")) return true;
+    if (containsIgnoreCase(trimmed, "startup sequence")) return true;
+
+    // Pure acknowledgement / thanks (only if message is short)
+    if (trimmed.len < 80) {
+        const trivial_phrases = [_][]const u8{
+            "dankjewel", "dank je",  "bedankt",
+            "thanks",    "thank you", "top dankjewel",
+            "goed zo",   "mooi zo",  "prima",
+            "ok\xc3\xa9", // oké (UTF-8)
+        };
+        const lower_buf = lowerSlice(trimmed);
+        for (trivial_phrases) |phrase| {
+            if (containsIgnoreCase(lower_buf[0..@min(lower_buf.len, trimmed.len)], phrase)) return true;
+        }
+    }
+
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+}
+
+/// Lowercases up to 128 bytes on the stack for quick matching.
+fn lowerSlice(s: []const u8) [128]u8 {
+    var buf: [128]u8 = undefined;
+    const len = @min(s.len, 128);
+    for (0..len) |i| {
+        buf[i] = std.ascii.toLower(s[i]);
+    }
+    return buf;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Contract generation
@@ -81,7 +136,10 @@ const CONTRACT_SYSTEM_PROMPT =
     \\- "checkpoints": array of 1-5 objects, each with:
     \\  - "description": what should happen (max 15 words)
     \\  - "check_type": one of "tool_success", "no_errors", "response_contains"
-    \\  - "expected": (only for response_contains) substring to look for in the response
+    \\  - "expected": (only for response_contains) 1-3 keywords to look for in the response.
+    \\    Use short, concrete words (names, numbers, actions) that will appear literally.
+    \\    Separate multiple keywords with spaces. Prefer the language of the user message.
+    \\    Good: "opgeslagen NAS"  Bad: "The file was saved to NAS storage"
     \\Output ONLY valid JSON. No explanation, no markdown fences, no extra text.
 ;
 
@@ -232,21 +290,59 @@ fn stripJsonFences(text: []const u8) []const u8 {
 // Verification (rule-based, zero LLM cost)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Check if the response contains keywords from the expected string.
+/// Splits expected by whitespace; passes if the majority of words are found (case-insensitive).
+/// Single-word expected still works as a simple substring check.
+fn responseContainsKeywords(response: []const u8, expected: []const u8) bool {
+    if (expected.len == 0) return true;
+    // Fast path: if the whole string matches, no need to split
+    if (std.ascii.indexOfIgnoreCase(response, expected) != null) return true;
+
+    // Split by whitespace and check each word
+    var total: usize = 0;
+    var found: usize = 0;
+    var it = std.mem.tokenizeAny(u8, expected, " \t");
+    while (it.next()) |word| {
+        if (word.len < 2) continue; // skip single-char tokens
+        total += 1;
+        if (std.ascii.indexOfIgnoreCase(response, word) != null) {
+            found += 1;
+        }
+    }
+    if (total == 0) return true;
+    // Pass if majority of keywords found (at least half, rounded up)
+    return found * 2 >= total;
+}
+
 /// Verify a contract against the turn context and final response.
-pub fn verifyContract(contract: *TaskContract, turn_ctx: TurnContext, final_response: []const u8) ContractResult {
+/// Includes per-checkpoint detail for failure analysis.
+pub fn verifyContract(allocator: std.mem.Allocator, contract: *TaskContract, turn_ctx: TurnContext, final_response: []const u8) ContractResult {
     var passed: u8 = 0;
     const total: u8 = @intCast(@min(contract.checkpoints.len, 255));
+
+    // Build checkpoint details for JSONL logging
+    const details = allocator.alloc(CheckpointDetail, contract.checkpoints.len) catch null;
+    var detail_idx: usize = 0;
 
     for (contract.checkpoints) |*cp| {
         cp.passed = switch (cp.check_type) {
             .tool_success => turn_ctx.has_tool_calls and turn_ctx.tools_failed == 0,
             .no_errors => turn_ctx.tools_failed == 0 and !turn_ctx.max_iterations_hit,
             .response_contains => if (cp.expected) |needle|
-                std.ascii.indexOfIgnoreCase(final_response, needle) != null
+                responseContainsKeywords(final_response, needle)
             else
                 true,
         };
         if (cp.passed) passed += 1;
+
+        if (details) |d| {
+            d[detail_idx] = .{
+                .description = cp.description,
+                .check_type = cp.check_type.asStr(),
+                .passed = cp.passed,
+            };
+            detail_idx += 1;
+        }
     }
 
     return .{
@@ -259,6 +355,7 @@ pub fn verifyContract(contract: *TaskContract, turn_ctx: TurnContext, final_resp
         .checkpoints_total = total,
         .duration_ms = 0, // filled in by caller
         .verified_at = std.time.timestamp(),
+        .checkpoint_details = if (details) |d| d[0..detail_idx] else null,
     };
 }
 
@@ -282,7 +379,7 @@ pub fn persistResult(allocator: std.mem.Allocator, result: ContractResult) !void
     , .{ result.session_id, result.timestamp });
     try json_util.appendJsonString(&buf, allocator, result.task_summary);
     try w.print(
-        \\,"model":"{s}","skill":"{s}","checkpoints_passed":{d},"checkpoints_total":{d},"duration_ms":{d},"verified_at":{d}}}
+        \\,"model":"{s}","skill":"{s}","checkpoints_passed":{d},"checkpoints_total":{d},"duration_ms":{d},"verified_at":{d}
     , .{
         result.model,
         result.skill,
@@ -291,7 +388,23 @@ pub fn persistResult(allocator: std.mem.Allocator, result: ContractResult) !void
         result.duration_ms,
         result.verified_at,
     });
-    try w.writeByte('\n');
+
+    // Append per-checkpoint details for failure analysis
+    if (result.checkpoint_details) |details| {
+        try w.writeAll(",\"checkpoint_details\":[");
+        for (details, 0..) |d, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"desc\":");
+            try json_util.appendJsonString(&buf, allocator, d.description);
+            try w.print(",\"type\":\"{s}\",\"passed\":{s}}}", .{
+                d.check_type,
+                if (d.passed) "true" else "false",
+            });
+        }
+        try w.writeByte(']');
+    }
+
+    try w.writeAll("}\n");
 
     const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
     defer file.close();
@@ -408,9 +521,17 @@ test "verifyContract all passing" {
         .max_iterations_hit = false,
     };
 
-    const result = verifyContract(&contract, ctx, "done");
+    const result = verifyContract(allocator, &contract, ctx, "done");
+    defer if (result.checkpoint_details) |d| allocator.free(d);
     try std.testing.expectEqual(@as(u8, 2), result.checkpoints_passed);
     try std.testing.expectEqual(@as(u8, 2), result.checkpoints_total);
+
+    // Verify checkpoint details are populated
+    try std.testing.expect(result.checkpoint_details != null);
+    const details = result.checkpoint_details.?;
+    try std.testing.expectEqual(@as(usize, 2), details.len);
+    try std.testing.expect(details[0].passed);
+    try std.testing.expect(details[1].passed);
 }
 
 test "verifyContract with failures" {
@@ -436,8 +557,14 @@ test "verifyContract with failures" {
         .max_iterations_hit = false,
     };
 
-    const result = verifyContract(&contract, ctx, "error occurred");
+    const result = verifyContract(allocator, &contract, ctx, "error occurred");
+    defer if (result.checkpoint_details) |d| allocator.free(d);
     try std.testing.expectEqual(@as(u8, 0), result.checkpoints_passed);
+
+    // Verify details show which failed
+    const details = result.checkpoint_details.?;
+    try std.testing.expect(!details[0].passed);
+    try std.testing.expect(!details[1].passed);
 }
 
 test "verifyContract response_contains" {
@@ -459,11 +586,59 @@ test "verifyContract response_contains" {
 
     const ctx = TurnContext{};
 
-    const result_pass = verifyContract(&contract, ctx, "Bestand opgeslagen op NAS");
+    const result_pass = verifyContract(allocator, &contract, ctx, "Bestand opgeslagen op NAS");
+    defer if (result_pass.checkpoint_details) |d| allocator.free(d);
     try std.testing.expectEqual(@as(u8, 1), result_pass.checkpoints_passed);
 
     // Reset
     checkpoints[0].passed = false;
-    const result_fail = verifyContract(&contract, ctx, "Klaar met de taak");
+    const result_fail = verifyContract(allocator, &contract, ctx, "Klaar met de taak");
+    defer if (result_fail.checkpoint_details) |d| allocator.free(d);
     try std.testing.expectEqual(@as(u8, 0), result_fail.checkpoints_passed);
+}
+
+test "responseContainsKeywords multi-word matching" {
+    // Exact substring match (fast path)
+    try std.testing.expect(responseContainsKeywords("email verstuurd naar Sander", "verstuurd naar Sander"));
+
+    // Multi-word: all keywords found
+    try std.testing.expect(responseContainsKeywords("Email verstuurd naar Sander met agenda", "verstuurd Sander agenda"));
+
+    // Multi-word: majority found (2/3)
+    try std.testing.expect(responseContainsKeywords("Email verstuurd naar Sander", "verstuurd Sander factuur"));
+
+    // Multi-word: minority found (1/3) → fail
+    try std.testing.expect(!responseContainsKeywords("Email verstuurd naar Sander", "factuur betaling archief"));
+
+    // Single-char tokens skipped
+    try std.testing.expect(responseContainsKeywords("archief klaar", "a archief"));
+
+    // Empty expected → pass
+    try std.testing.expect(responseContainsKeywords("anything", ""));
+
+    // Case insensitive
+    try std.testing.expect(responseContainsKeywords("Email VERSTUURD naar sander", "verstuurd Sander"));
+}
+
+test "shouldSkipContract filters trivial messages" {
+    // Short messages
+    try std.testing.expect(shouldSkipContract("ok"));
+    try std.testing.expect(shouldSkipContract("  top  "));
+    try std.testing.expect(shouldSkipContract("ja"));
+
+    // Thank-you messages
+    try std.testing.expect(shouldSkipContract("Top dankjewel!"));
+    try std.testing.expect(shouldSkipContract("Bedankt voor de update"));
+    try std.testing.expect(shouldSkipContract("Thanks!"));
+    try std.testing.expect(shouldSkipContract("Mooi zo, prima"));
+
+    // Session startup
+    try std.testing.expect(shouldSkipContract("Execute session startup sequence by reading files"));
+    try std.testing.expect(shouldSkipContract("Run the startup sequence for this session"));
+
+    // Real tasks should NOT be skipped
+    try std.testing.expect(!shouldSkipContract("Stuur een email naar Daisha over de afspraak van morgen"));
+    try std.testing.expect(!shouldSkipContract("Hoeveel uren heb ik deze week gewerkt in Toggl?"));
+    try std.testing.expect(!shouldSkipContract("Maak een rapport van de coding taken van deze week"));
+    try std.testing.expect(!shouldSkipContract("Check de status van het casemanager project"));
 }

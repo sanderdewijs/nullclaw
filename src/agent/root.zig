@@ -1882,13 +1882,25 @@ pub const Agent = struct {
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
+        // Strip [IMAGE:] markers before saving — stale image paths in recalled
+        // memories break multimodal processing on subsequent turns.
         if (self.auto_save) {
             if (self.mem) |mem| {
+                const save_content = blk: {
+                    if (std.mem.indexOf(u8, effective_user_message, "[IMAGE:") != null or
+                        std.mem.indexOf(u8, effective_user_message, "[image:") != null)
+                    {
+                        const parsed = multimodal.parseImageMarkers(self.allocator, effective_user_message) catch break :blk effective_user_message;
+                        defer self.allocator.free(parsed.refs);
+                        break :blk parsed.cleaned_text;
+                    }
+                    break :blk effective_user_message;
+                };
                 const ts: u128 = @bitCast(std.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
+                    if (mem.store(key, save_content, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
                             rt.syncVectorAfterStore(self.allocator, key, effective_user_message, self.memory_session_id);
@@ -1936,18 +1948,23 @@ pub const Agent = struct {
 
         // ── Task contract: generate pre-task checkpoints (best-effort) ──
         if (self.task_contracts_enabled) {
-            self.current_contract = task_contract.generateContract(
-                self.allocator,
-                self.provider,
-                self.task_contracts_model,
-                effective_user_message,
-                self.memory_session_id orelse "",
-                turn_model_name,
-                self.routed_skill orelse "general",
-                self.task_contracts_max_checkpoints,
-            );
-            if (self.current_contract) |c| {
-                log.info("contract: \"{s}\" ({d} checkpoints)", .{ c.task_summary, c.checkpoints.len });
+            if (task_contract.shouldSkipContract(effective_user_message)) {
+                log.debug("contract skipped: trivial message", .{});
+                self.current_contract = null;
+            } else {
+                self.current_contract = task_contract.generateContract(
+                    self.allocator,
+                    self.provider,
+                    self.task_contracts_model,
+                    effective_user_message,
+                    self.memory_session_id orelse "",
+                    turn_model_name,
+                    self.routed_skill orelse "general",
+                    self.task_contracts_max_checkpoints,
+                );
+                if (self.current_contract) |c| {
+                    log.info("contract: \"{s}\" ({d} checkpoints)", .{ c.task_summary, c.checkpoints.len });
+                }
             }
         }
 
@@ -2412,7 +2429,7 @@ pub const Agent = struct {
 
                 // ── Task contract: verify checkpoints and persist result ──
                 if (self.current_contract) |*contract| {
-                    var result = task_contract.verifyContract(contract, turn_ctx, final_text);
+                    var result = task_contract.verifyContract(self.allocator, contract, turn_ctx, final_text);
                     // duration = now - contract creation timestamp (seconds → ms approximation)
                     const now_s = std.time.timestamp();
                     result.duration_ms = if (now_s > contract.timestamp)

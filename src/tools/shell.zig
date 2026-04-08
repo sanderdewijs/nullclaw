@@ -153,6 +153,7 @@ pub const ShellTool = struct {
                             summary.byte_len,
                             summary.assignment_count,
                         });
+                        log.warn("blocked command content: {s}", .{if (command.len > 300) command[0..300] else command});
                         break :blk ToolResult.fail("Command not allowed by security policy");
                     },
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),

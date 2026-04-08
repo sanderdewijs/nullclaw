@@ -245,6 +245,7 @@ pub fn workspacePromptFingerprint(
             "BOOTSTRAP.md",
             "MEMORY.md",
             "memory.md",
+            "LEARNINGS.md",
         };
 
         for (tracked_files) |filename| {
@@ -462,6 +463,7 @@ fn buildIdentitySection(
         "USER.md",
         "HEARTBEAT.md",
         "BOOTSTRAP.md",
+        "LEARNINGS.md",
     };
 
     for (identity_files) |filename| {

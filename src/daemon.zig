@@ -475,11 +475,13 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
 
     while (!isShutdownRequested()) {
         var snapshot_ok = true;
+
+        // Phase 1: under lock — reload, collect shell results + deferred agent jobs
+        var deferred: []cron.DeferredAgentJob = &.{};
         gateway_mod.lockSharedScheduler();
         {
             defer gateway_mod.unlockSharedScheduler();
 
-            // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
             cron.reloadJobs(&scheduler) catch |err| {
                 log.warn("scheduler reload failed: {}", .{err});
                 state.markError("scheduler", @errorName(err));
@@ -494,14 +496,42 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             };
 
             if (snapshot_ok) {
-                const changed = scheduler.tick(std.time.timestamp(), event_bus);
-                if (changed) {
-                    mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
-                        log.warn("scheduler merge-save failed: {}", .{err});
-                        state.markError("scheduler", @errorName(err));
-                        health.markComponentError("scheduler", @errorName(err));
-                    };
-                }
+                deferred = scheduler.tickDeferred(std.time.timestamp(), event_bus, allocator);
+            }
+        }
+
+        // Phase 2: without lock — execute agent jobs (may call back into gateway)
+        if (deferred.len > 0) {
+            for (deferred) |*d| {
+                if (isShutdownRequested()) break;
+                d.result = cron.runAgentJob(allocator, config.workspace_dir, d.prompt, d.model, config.scheduler.agent_timeout_secs) catch {
+                    d.spawn_err = true;
+                    continue;
+                };
+            }
+
+            // Phase 3: under lock — write results back and save
+            gateway_mod.lockSharedScheduler();
+            {
+                defer gateway_mod.unlockSharedScheduler();
+                scheduler.applyDeferredResults(deferred, std.time.timestamp(), event_bus);
+                mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                    log.warn("scheduler merge-save failed: {}", .{err});
+                    state.markError("scheduler", @errorName(err));
+                    health.markComponentError("scheduler", @errorName(err));
+                };
+            }
+            allocator.free(deferred);
+        } else if (snapshot_ok) {
+            // No deferred jobs but shell jobs may have changed state — save under lock
+            gateway_mod.lockSharedScheduler();
+            {
+                defer gateway_mod.unlockSharedScheduler();
+                mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
+                    log.warn("scheduler merge-save failed: {}", .{err});
+                    state.markError("scheduler", @errorName(err));
+                    health.markComponentError("scheduler", @errorName(err));
+                };
             }
         }
 

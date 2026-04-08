@@ -1978,12 +1978,15 @@ pub const SessionManager = struct {
         session.digest_generated = true;
 
         // Forward digest to observer pipeline (→ RAG API)
+        const turns: u32 = @intCast(@min(session.turn_count, std.math.maxInt(u32)));
         const digest_event = observability.ObserverEvent{ .digest_ready = .{
             .session_id = session.session_key,
             .summary = digest.summary,
             .user_preferences = digest.user_preferences,
             .tool_insights = digest.tool_insights,
             .task_patterns = digest.task_patterns,
+            .user_turns = turns,
+            .assistant_turns = turns,
         } };
         self.observer.recordEvent(&digest_event);
 
