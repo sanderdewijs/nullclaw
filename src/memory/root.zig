@@ -1253,6 +1253,27 @@ pub fn initRuntime(
         }
     }
 
+    // ── Lifecycle: dreaming ──
+    if (config.dreaming.enabled) {
+        const dream_cfg = dreaming.DreamingConfig{
+            .enabled = true,
+            .frequency = config.dreaming.frequency,
+            .timezone = config.dreaming.timezone,
+            .workspace_dir = workspace_dir,
+        };
+        const dream_report = dreaming.runIfDue(allocator, dream_cfg, instance.memory);
+        if (!dream_report.skipped) {
+            log.info("dreaming: cycle completed, light={d} deep={d}/{d} rem={s}", .{
+                dream_report.light_recall_events_processed,
+                dream_report.deep_entries_promoted,
+                dream_report.deep_entries_scored,
+                if (dream_report.rem_prompt != null) "yes" else "no",
+            });
+            var report_mut = dream_report;
+            report_mut.deinit(allocator);
+        }
+    }
+
     // Enforce fallback_policy: if fail_fast and vector plane was expected but failed, abort.
     if (std.mem.eql(u8, config.reliability.fallback_policy, "fail_fast")) {
         const vector_expected = config.search.enabled and

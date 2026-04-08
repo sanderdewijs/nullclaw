@@ -314,7 +314,7 @@ fn buildRemPrompt(allocator: std.mem.Allocator, mem: Memory, state: *const Dream
 
     if (count == 0) return null;
 
-    return std.fmt.allocPrint(allocator,
+    const prompt = try std.fmt.allocPrint(allocator,
         \\You are reviewing your long-term memory after a dream cycle.
         \\Below are {d} memory entries that were recently promoted to core memory
         \\because they were frequently recalled across multiple sessions.
@@ -331,6 +331,7 @@ fn buildRemPrompt(allocator: std.mem.Allocator, mem: Memory, state: *const Dream
         \\Write your reflection in the first person. Be concise and insightful.
         \\Save the reflection to DREAMS.md using file_edit (append, don't overwrite).
     , .{ count, contents.items });
+    return prompt;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
