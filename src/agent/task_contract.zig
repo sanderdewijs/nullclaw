@@ -98,9 +98,9 @@ pub fn shouldSkipContract(user_message: []const u8) bool {
     // Pure acknowledgement / thanks (only if message is short)
     if (trimmed.len < 80) {
         const trivial_phrases = [_][]const u8{
-            "dankjewel", "dank je",  "bedankt",
+            "dankjewel", "dank je",   "bedankt",
             "thanks",    "thank you", "top dankjewel",
-            "goed zo",   "mooi zo",  "prima",
+            "goed zo",   "mooi zo",   "prima",
             "ok\xc3\xa9", // oké (UTF-8)
         };
         const lower_buf = lowerSlice(trimmed);

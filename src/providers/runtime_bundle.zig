@@ -14,6 +14,7 @@ const HolderPlan = struct {
     native_tools: bool,
     user_agent: ?[]const u8,
     api_mode: @import("../config_types.zig").ProviderEntry.ApiMode,
+    chat_template_enable_thinking_param: bool,
     max_streaming_prompt_bytes: ?usize,
 };
 
@@ -65,6 +66,7 @@ fn appendHolderPlan(
         .native_tools = cfg.getProviderNativeTools(provider_name),
         .user_agent = cfg.getProviderUserAgent(provider_name),
         .api_mode = cfg.getProviderApiMode(provider_name),
+        .chat_template_enable_thinking_param = cfg.getProviderChatTemplateEnableThinkingParam(provider_name),
         .max_streaming_prompt_bytes = cfg.getProviderMaxStreamingPromptBytes(provider_name),
     });
     return plans.items.len;
@@ -120,6 +122,7 @@ pub const RuntimeProviderBundle = struct {
             cfg.getProviderUserAgent(cfg.default_provider),
             cfg.getProviderApiMode(cfg.default_provider),
             cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
+            cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
         );
 
         if (cfg.model_routes.len > 0) {
@@ -222,6 +225,7 @@ pub const RuntimeProviderBundle = struct {
                         plan.user_agent,
                         plan.api_mode,
                         plan.max_streaming_prompt_bytes,
+                        plan.chat_template_enable_thinking_param,
                     );
                     bundle.router_holders_initialized = i + 1;
                 }
@@ -294,6 +298,7 @@ pub const RuntimeProviderBundle = struct {
                     cfg.getProviderUserAgent(provider_name),
                     cfg.getProviderApiMode(provider_name),
                     cfg.getProviderMaxStreamingPromptBytes(provider_name),
+                    cfg.getProviderChatTemplateEnableThinkingParam(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -322,6 +327,7 @@ pub const RuntimeProviderBundle = struct {
                         cfg.getProviderUserAgent(cfg.default_provider),
                         cfg.getProviderApiMode(cfg.default_provider),
                         cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
+                        cfg.getProviderChatTemplateEnableThinkingParam(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{
@@ -573,6 +579,30 @@ test "RuntimeProviderBundle threads api_mode to primary provider" {
         @import("compatible.zig").CompatibleApiMode.responses,
         bundle.primary_holder.?.compatible.api_mode,
     );
+}
+
+test "RuntimeProviderBundle threads chat_template_enable_thinking_param to primary provider" {
+    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
+        .{
+            .name = "custom:https://example.com/v1",
+            .api_key = "sk_test",
+            .chat_template_enable_thinking_param = true,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "custom:https://example.com/v1",
+        .providers = &providers_cfg,
+    };
+
+    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
+    defer bundle.deinit();
+
+    try std.testing.expect(bundle.primary_holder != null);
+    try std.testing.expect(bundle.primary_holder.?.* == .compatible);
+    try std.testing.expect(bundle.primary_holder.?.compatible.chat_template_enable_thinking_param);
 }
 
 test "RuntimeProviderBundle threads max_streaming_prompt_bytes to fallback providers" {

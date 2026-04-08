@@ -18,6 +18,7 @@ const TestCompleteFn = *const fn (
     native_tools: bool,
     user_agent: ?[]const u8,
     api_mode: ProviderEntry.ApiMode,
+    chat_template_enable_thinking_param: bool,
     model: []const u8,
     system_prompt: []const u8,
     prompt: []const u8,
@@ -120,6 +121,7 @@ pub const DelegateTool = struct {
                 if (provider_entry) |entry| entry.native_tools else true,
                 if (provider_entry) |entry| entry.user_agent else null,
                 if (provider_entry) |entry| entry.api_mode else .chat_completions,
+                if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
                 ac.model,
                 sys_prompt,
                 full_prompt,
@@ -183,6 +185,7 @@ pub const DelegateTool = struct {
         native_tools: bool,
         user_agent: ?[]const u8,
         api_mode: ProviderEntry.ApiMode,
+        chat_template_enable_thinking_param: bool,
         model: []const u8,
         system_prompt: []const u8,
         prompt: []const u8,
@@ -190,7 +193,20 @@ pub const DelegateTool = struct {
     ) ![]const u8 {
         if (builtin.is_test) {
             if (test_complete_agent_prompt_override) |override| {
-                return override(allocator, provider_name, api_key, base_url, native_tools, user_agent, api_mode, model, system_prompt, prompt, temperature);
+                return override(
+                    allocator,
+                    provider_name,
+                    api_key,
+                    base_url,
+                    native_tools,
+                    user_agent,
+                    api_mode,
+                    chat_template_enable_thinking_param,
+                    model,
+                    system_prompt,
+                    prompt,
+                    temperature,
+                );
             }
         }
         var provider_holder = providers.ProviderHolder.fromConfigWithApiMode(
@@ -205,9 +221,8 @@ pub const DelegateTool = struct {
             // The delegate tool performs short, single-turn completions where
             // token volumes are small and streaming is not used.  Passing null
             // means "no limit" (always stream), which is correct for this path.
-            // If a named agent config with a provider entry is used the field
-            // will be threaded through via the agent config resolution above.
             null,
+            chat_template_enable_thinking_param,
         );
         defer provider_holder.deinit();
         return provider_holder.provider().chatWithSystem(
@@ -227,6 +242,7 @@ var test_expected_base_url: ?[]const u8 = null;
 var test_expected_native_tools: ?bool = null;
 var test_expected_user_agent: ?[]const u8 = null;
 var test_expected_api_mode: ?ProviderEntry.ApiMode = null;
+var test_expected_chat_template_enable_thinking_param: ?bool = null;
 var test_expected_model_name: ?[]const u8 = null;
 var test_expected_system_prompt: ?[]const u8 = null;
 var test_expected_prompt: ?[]const u8 = null;
@@ -239,6 +255,7 @@ fn testCompleteAgentPrompt(
     native_tools: bool,
     user_agent: ?[]const u8,
     api_mode: ProviderEntry.ApiMode,
+    chat_template_enable_thinking_param: bool,
     model: []const u8,
     system_prompt: []const u8,
     prompt: []const u8,
@@ -265,6 +282,9 @@ fn testCompleteAgentPrompt(
     }
     if (test_expected_api_mode) |expected| {
         try std.testing.expectEqual(expected, api_mode);
+    }
+    if (test_expected_chat_template_enable_thinking_param) |expected| {
+        try std.testing.expectEqual(expected, chat_template_enable_thinking_param);
     }
     if (test_expected_model_name) |expected| {
         try std.testing.expectEqualStrings(expected, model);
@@ -577,6 +597,7 @@ test "delegate uses configured provider entry for key and base_url" {
     test_expected_native_tools = false;
     test_expected_user_agent = "nullclaw-test";
     test_expected_api_mode = .responses;
+    test_expected_chat_template_enable_thinking_param = true;
     test_expected_model_name = "qwen3.5:cloud";
     test_expected_system_prompt = "You are a coder.";
     test_expected_prompt = "Fix it";
@@ -587,6 +608,7 @@ test "delegate uses configured provider entry for key and base_url" {
         test_expected_native_tools = null;
         test_expected_user_agent = null;
         test_expected_api_mode = null;
+        test_expected_chat_template_enable_thinking_param = null;
         test_expected_model_name = null;
         test_expected_system_prompt = null;
         test_expected_prompt = null;
@@ -608,6 +630,7 @@ test "delegate uses configured provider entry for key and base_url" {
             .native_tools = false,
             .user_agent = "nullclaw-test",
             .api_mode = .responses,
+            .chat_template_enable_thinking_param = true,
         },
     };
 

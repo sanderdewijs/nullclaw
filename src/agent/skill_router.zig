@@ -317,16 +317,17 @@ fn countOverlap(a: []const []const u8, b: []const []const u8) usize {
 fn isStopWord(word: []const u8) bool {
     const stops = [_][]const u8{
         // Dutch
-        "de",  "het",  "een",  "en",   "van",  "in",  "is",   "op",
-        "te",  "dat",  "die",  "voor", "met",  "zijn", "aan", "er",
-        "als", "kan",  "naar", "om",   "dan",  "ook", "bij",  "nog",
-        "uit", "maar", "niet", "wel",  "wat",  "dit", "door", "over",
-        "je",  "ze",   "we",   "hij",  "hun",
+        "de",   "het",  "een",  "en",   "van",  "in",   "is",   "op",
+        "te",   "dat",  "die",  "voor", "met",  "zijn", "aan",  "er",
+        "als",  "kan",  "naar", "om",   "dan",  "ook",  "bij",  "nog",
+        "uit",  "maar", "niet", "wel",  "wat",  "dit",  "door", "over",
+        "je",   "ze",   "we",   "hij",  "hun",
         // English
-        "the", "and",  "for",  "with", "from", "that", "this", "are",
-        "was", "has",  "have", "will", "can",  "all",  "its",  "use",
-        "via", "when", "how",  "you",  "your", "into", "such", "each",
-        "been","any",  "may",  "than",
+         "the",  "and",  "for",
+        "with", "from", "that", "this", "are",  "was",  "has",  "have",
+        "will", "can",  "all",  "its",  "use",  "via",  "when", "how",
+        "you",  "your", "into", "such", "each", "been", "any",  "may",
+        "than",
     };
     for (stops) |s| {
         if (std.mem.eql(u8, word, s)) return true;
@@ -431,7 +432,7 @@ test "countOverlap_full_exact_match" {
 
 test "countOverlap_empty" {
     const a = &[_][]const u8{};
-    const b = &[_][]const u8{ "coding" };
+    const b = &[_][]const u8{"coding"};
     try testing.expectEqual(@as(usize, 0), countOverlap(a, b));
 }
 
@@ -500,7 +501,7 @@ test "SkillRouter_route_meeting_query" {
     defer router.deinit();
 
     // "meeting" matches skill name "meeting-planner" (name weight 3x)
-    const results = router.route(alloc,"Schedule a meeting with the client", 3, null);
+    const results = router.route(alloc, "Schedule a meeting with the client", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -518,7 +519,7 @@ test "SkillRouter_route_coding_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Deploy the coding project to production", 3, null);
+    const results = router.route(alloc, "Deploy the coding project to production", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -536,7 +537,7 @@ test "SkillRouter_route_email_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Search through my email inbox", 3, null);
+    const results = router.route(alloc, "Search through my email inbox", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -555,7 +556,7 @@ test "SkillRouter_route_respects_limit" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Show me the tasks operations status", 2, null);
+    const results = router.route(alloc, "Show me the tasks operations status", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len <= 2);
@@ -563,12 +564,12 @@ test "SkillRouter_route_respects_limit" {
 
 test "SkillRouter_route_no_match_returns_empty" {
     const alloc = testing.allocator;
-    const names = &[_][]const u8{ "meeting-planner" };
+    const names = &[_][]const u8{"meeting-planner"};
     const descs = &[_][]const u8{"Manage consultation appointments"};
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Vertel me een grap", 3, null);
+    const results = router.route(alloc, "Vertel me een grap", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expectEqual(@as(usize, 0), results.len);
@@ -581,7 +582,7 @@ test "SkillRouter_route_empty_message" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"", 3, null);
+    const results = router.route(alloc, "", 3, null);
     defer freeScored(alloc, results);
 
     try testing.expectEqual(@as(usize, 0), results.len);
@@ -598,7 +599,7 @@ test "SkillRouter_route_name_match_weighs_more" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Check my email", 2, null);
+    const results = router.route(alloc, "Check my email", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -619,7 +620,7 @@ test "SkillRouter_route_dutch_query" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Wat zijn de cursussen bij Wellenberg?", 2, null);
+    const results = router.route(alloc, "Wat zijn de cursussen bij Wellenberg?", 2, null);
     defer freeScored(alloc, results);
 
     try testing.expect(results.len >= 1);
@@ -637,7 +638,7 @@ test "SkillRouter_route_sorted_descending" {
     var router = SkillRouter.init(alloc, names, descs);
     defer router.deinit();
 
-    const results = router.route(alloc,"Run the tasks operations management", 3, null);
+    const results = router.route(alloc, "Run the tasks operations management", 3, null);
     defer freeScored(alloc, results);
 
     // Verify sorted descending
@@ -651,7 +652,7 @@ test "SkillRouter_empty_skills" {
     var router = SkillRouter.init(alloc, &.{}, &.{});
     defer router.deinit();
 
-    const results = router.route(alloc,"hello", 3, null);
+    const results = router.route(alloc, "hello", 3, null);
     defer freeScored(alloc, results);
     try testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -692,7 +693,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 1: Appointment query → meeting-planner
     {
-        const r = router.route(alloc,"Plan een afspraak bij Daisha", 3, null);
+        const r = router.route(alloc, "Plan een afspraak bij Daisha", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 0), r[0].index); // meeting-planner
@@ -700,7 +701,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 2: Email query → imap-email
     {
-        const r = router.route(alloc,"Zoek in mijn email naar de factuur", 3, null);
+        const r = router.route(alloc, "Zoek in mijn email naar de factuur", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 1), r[0].index); // imap-email
@@ -708,7 +709,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 3: Knowledge query → rag-knowledge
     {
-        const r = router.route(alloc,"Welke cursussen biedt Wellenberg aan?", 3, null);
+        const r = router.route(alloc, "Welke cursussen biedt Wellenberg aan?", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 2), r[0].index); // rag-knowledge
@@ -716,7 +717,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 4: Coding query → coding-agent
     {
-        const r = router.route(alloc,"Fix the bug in the coding project", 3, null);
+        const r = router.route(alloc, "Fix the bug in the coding project", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 3), r[0].index); // coding-agent
@@ -724,7 +725,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 5: NAS query → nas-documents
     {
-        const r = router.route(alloc,"Sla dit document op de NAS", 3, null);
+        const r = router.route(alloc, "Sla dit document op de NAS", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 5), r[0].index); // nas-documents
@@ -732,7 +733,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 6: Invoice query → toggl-invoice
     {
-        const r = router.route(alloc,"Maak de maandelijkse Toggl invoice", 3, null);
+        const r = router.route(alloc, "Maak de maandelijkse Toggl invoice", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
@@ -740,7 +741,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 7: Uren overzicht → toggl-invoice (substring: "uren" in "urenoverzicht")
     {
-        const r = router.route(alloc,"Stuur me een overzicht van mijn uren van de afgelopen week", 3, null);
+        const r = router.route(alloc, "Stuur me een overzicht van mijn uren van de afgelopen week", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 7), r[0].index); // toggl-invoice
@@ -748,7 +749,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 8: RAG zoeken → rag-knowledge (exact: "RAG", "zoeken")
     {
-        const r = router.route(alloc,"Zoek in de RAG naar informatie over de GGZ workshop", 3, null);
+        const r = router.route(alloc, "Zoek in de RAG naar informatie over de GGZ workshop", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         try testing.expectEqual(@as(usize, 2), r[0].index); // rag-knowledge
@@ -756,7 +757,7 @@ test "SkillRouter_donna_full_skill_set" {
 
     // Test 9: Text writer → text-writer or related skill
     {
-        const r = router.route(alloc,"Schrijf een opzet voor de workshop en sla het op als Word document", 3, null);
+        const r = router.route(alloc, "Schrijf een opzet voor de workshop en sla het op als Word document", 3, null);
         defer freeScored(alloc, r);
         try testing.expect(r.len >= 1);
         // Should match a writing/document skill. Log the actual index for debugging.
