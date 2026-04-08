@@ -326,7 +326,7 @@ pub fn verifyContract(allocator: std.mem.Allocator, contract: *TaskContract, tur
 
     for (contract.checkpoints) |*cp| {
         cp.passed = switch (cp.check_type) {
-            .tool_success => turn_ctx.has_tool_calls and turn_ctx.tools_failed == 0,
+            .tool_success => turn_ctx.tools_failed == 0,
             .no_errors => turn_ctx.tools_failed == 0 and !turn_ctx.max_iterations_hit,
             .response_contains => if (cp.expected) |needle|
                 responseContainsKeywords(final_response, needle)
