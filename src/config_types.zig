@@ -1125,6 +1125,7 @@ pub const MemoryConfig = struct {
     clickhouse: MemoryClickHouseConfig = .{},
     retrieval_stages: MemoryRetrievalStagesConfig = .{},
     summarizer: MemorySummarizerConfig = .{},
+    dreaming: MemoryDreamingConfig = .{},
 
     /// Apply profile defaults. Only sets fields that are still at their default values,
     /// so explicit user overrides always win (profile is applied AFTER parsing).
@@ -1369,6 +1370,14 @@ pub const MemorySummarizerConfig = struct {
     window_size_tokens: u32 = 4000,
     summary_max_tokens: u32 = 500,
     auto_extract_semantic: bool = true,
+};
+
+pub const MemoryDreamingConfig = struct {
+    enabled: bool = false,
+    /// Cron expression for scheduling (default: 3 AM daily).
+    frequency: []const u8 = "0 3 * * *",
+    /// IANA timezone for the schedule.
+    timezone: []const u8 = "",
 };
 
 // ── Tunnel config ───────────────────────────────────────────────

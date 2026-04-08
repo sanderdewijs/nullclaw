@@ -65,6 +65,7 @@ pub const ObserverEvent = union(enum) {
     subagent_start: struct { agent_name: []const u8, task: []const u8 },
     cron_job_start: struct { task: []const u8, channel: ?[]const u8 = null, bot_account: ?[]const u8 = null },
     skill_load: struct { name: []const u8, duration_ms: u64 },
+    dream_cycle: struct { cycle: u64, light_events: u64, deep_scored: u64, deep_promoted: u64, has_rem: bool },
 };
 
 /// Numeric metrics.
@@ -258,6 +259,7 @@ pub const LogObserver = struct {
                 }
             },
             .skill_load => |e| std.log.info("skill.load name={s} duration_ms={d}", .{ e.name, e.duration_ms }),
+            .dream_cycle => |e| std.log.info("dream.cycle cycle={d} light={d} scored={d} promoted={d} rem={}", .{ e.cycle, e.light_events, e.deep_scored, e.deep_promoted, e.has_rem }),
         }
     }
 
@@ -337,6 +339,9 @@ pub const VerboseObserver = struct {
             },
             .skill_load => |e| {
                 stderr.print("> Skill {s} loaded in {d}ms\n", .{ e.name, e.duration_ms }) catch {};
+            },
+            .dream_cycle => |e| {
+                stderr.print("> Dream cycle {d}: {d} promoted ({d}/{d} scored), rem={}\n", .{ e.cycle, e.deep_promoted, e.deep_scored, e.light_events, e.has_rem }) catch {};
             },
             else => {},
         }
@@ -543,6 +548,7 @@ pub const FileObserver = struct {
                 break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\"}}", .{}) catch return;
             },
             .skill_load => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"skill_load\",\"name\":{f},\"duration_ms\":{d}}}", .{ std.json.fmt(e.name, .{}), e.duration_ms }) catch return,
+            .dream_cycle => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"dream_cycle\",\"cycle\":{d},\"light_events\":{d},\"deep_scored\":{d},\"deep_promoted\":{d},\"has_rem\":{}}}", .{ e.cycle, e.light_events, e.deep_scored, e.deep_promoted, e.has_rem }) catch return,
         };
         self.appendToFile(line);
     }
@@ -1071,6 +1077,23 @@ pub const OtelObserver = struct {
                 self.addSpan("skill.load", now -| (e.duration_ms * 1_000_000), now, &.{
                     .{ .key = "name", .value = e.name },
                     .{ .key = "duration_ms", .value = dur_str },
+                });
+            },
+            .dream_cycle => |e| {
+                var cycle_buf: [20]u8 = undefined;
+                var light_buf: [20]u8 = undefined;
+                var scored_buf: [20]u8 = undefined;
+                var promoted_buf: [20]u8 = undefined;
+                const cycle_str = std.fmt.bufPrint(&cycle_buf, "{d}", .{e.cycle}) catch "0";
+                const light_str = std.fmt.bufPrint(&light_buf, "{d}", .{e.light_events}) catch "0";
+                const scored_str = std.fmt.bufPrint(&scored_buf, "{d}", .{e.deep_scored}) catch "0";
+                const promoted_str = std.fmt.bufPrint(&promoted_buf, "{d}", .{e.deep_promoted}) catch "0";
+                self.addSpan("dream.cycle", now, now, &.{
+                    .{ .key = "cycle", .value = cycle_str },
+                    .{ .key = "light_events", .value = light_str },
+                    .{ .key = "deep_scored", .value = scored_str },
+                    .{ .key = "deep_promoted", .value = promoted_str },
+                    .{ .key = "has_rem", .value = if (e.has_rem) "true" else "false" },
                 });
             },
         }

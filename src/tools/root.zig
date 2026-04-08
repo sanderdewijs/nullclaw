@@ -452,7 +452,7 @@ pub fn allTools(
     try list.append(allocator, mst.tool());
 
     const mrt = try allocator.create(memory_recall.MemoryRecallTool);
-    mrt.* = .{};
+    mrt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, mrt.tool());
 
     const mlt = try allocator.create(memory_list.MemoryListTool);

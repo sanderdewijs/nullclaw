@@ -1978,6 +1978,22 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 }
             }
 
+            // dreaming
+            if (mem.object.get("dreaming")) |dream_val| {
+                if (dream_val == .object) {
+                    const dream = dream_val.object;
+                    if (dream.get("enabled")) |v| if (v == .bool) {
+                        self.memory.dreaming.enabled = v.bool;
+                    };
+                    if (dream.get("frequency")) |v| if (v == .string) {
+                        self.memory.dreaming.frequency = v.string;
+                    };
+                    if (dream.get("timezone")) |v| if (v == .string) {
+                        self.memory.dreaming.timezone = v.string;
+                    };
+                }
+            }
+
             // Apply profile defaults after all explicit overrides have been parsed.
             // Only sets fields that are still at their default values.
             self.memory.applyProfileDefaults();

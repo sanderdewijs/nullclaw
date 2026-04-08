@@ -65,6 +65,8 @@ pub const rollout = @import("lifecycle/rollout.zig");
 pub const migrate = @import("lifecycle/migrate.zig");
 pub const diagnostics = @import("lifecycle/diagnostics.zig");
 pub const summarizer = @import("lifecycle/summarizer.zig");
+pub const dreaming = @import("lifecycle/dreaming.zig");
+pub const dream_state = @import("lifecycle/dream_state.zig");
 
 pub const SqliteMemory = sqlite.SqliteMemory;
 pub const MarkdownMemory = markdown.MarkdownMemory;

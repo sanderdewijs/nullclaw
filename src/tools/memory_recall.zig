@@ -6,6 +6,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const MemoryEntry = mem_root.MemoryEntry;
+const dream_state = mem_root.dream_state;
 
 /// Memory recall tool — lets the agent search its own memory.
 /// When a MemoryRuntime is available, uses the full retrieval pipeline
@@ -14,6 +15,8 @@ const MemoryEntry = mem_root.MemoryEntry;
 pub const MemoryRecallTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    /// Workspace directory for dream recall tracking. Set by tool factory.
+    workspace_dir: []const u8 = "",
 
     pub const tool_name = "memory_recall";
     pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
@@ -195,6 +198,9 @@ pub const MemoryRecallTool = struct {
                 return ToolResult{ .success = true, .output = msg };
             }
 
+            // Track recalls for dreaming
+            self.trackRecalls(allocator, merged_candidates.items, selection.preferred_session_id);
+
             return formatCandidates(allocator, merged_candidates.items, visible_candidates);
         }
 
@@ -227,7 +233,40 @@ pub const MemoryRecallTool = struct {
             return ToolResult{ .success = true, .output = msg };
         }
 
+        // Track recalls for dreaming
+        self.trackRecallEntries(allocator, merged_entries.items, selection.preferred_session_id);
+
         return formatEntries(allocator, merged_entries.items, visible_entries);
+    }
+
+    /// Best-effort recall tracking for dreaming. Logs which keys were recalled
+    /// and by which session so the dreaming engine can score entries.
+    fn trackRecalls(self: *MemoryRecallTool, allocator: std.mem.Allocator, candidates: []const mem_root.RetrievalCandidate, session_id: ?[]const u8) void {
+        if (self.workspace_dir.len == 0) return;
+        const sid = session_id orelse "global";
+        const now = std.time.timestamp();
+        for (candidates) |cand| {
+            if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            dream_state.appendRecallEvent(allocator, self.workspace_dir, .{
+                .key = cand.key,
+                .session_id = sid,
+                .timestamp = now,
+            });
+        }
+    }
+
+    fn trackRecallEntries(self: *MemoryRecallTool, allocator: std.mem.Allocator, entries: []const MemoryEntry, session_id: ?[]const u8) void {
+        if (self.workspace_dir.len == 0) return;
+        const sid = session_id orelse "global";
+        const now = std.time.timestamp();
+        for (entries) |entry| {
+            if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            dream_state.appendRecallEvent(allocator, self.workspace_dir, .{
+                .key = entry.key,
+                .session_id = sid,
+                .timestamp = now,
+            });
+        }
     }
 
     fn countVisibleEntries(entries: []const MemoryEntry) usize {
