@@ -26,11 +26,12 @@ fn buildSubagentSystemPrompt(
     system_prompt: []const u8,
     workspace_dir: []const u8,
     tools: []const tools_mod.Tool,
+    observer: ?observability.Observer,
 ) ![]const u8 {
     const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
-    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir);
+    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir, observer);
     defer allocator.free(skills_section);
 
     if (skills_section.len > 0) {
@@ -70,6 +71,7 @@ pub fn runTaskWithTools(
         provider_user_agent,
         provider_api_mode,
         provider_max_streaming_prompt_bytes,
+        if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
     );
     defer provider_holder.deinit();
 
@@ -163,6 +165,7 @@ pub fn runTaskWithTools(
         request.system_prompt,
         request.workspace_dir,
         tools,
+        obs,
     );
     // After append, ownership transfers to agent.history; agent.deinit() frees it.
     // Use catch to free only if append itself fails (avoids double-free with deinit).
@@ -225,6 +228,14 @@ test "findProviderEntry threads api_mode from entry" {
     try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, found.api_mode);
 }
 
+test "findProviderEntry threads chat_template_enable_thinking_param from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://example.com/v1", .api_key = "sk-test", .chat_template_enable_thinking_param = true },
+    };
+    const found = findProviderEntry("custom:https://example.com/v1", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(found.chat_template_enable_thinking_param);
+}
+
 test "findProviderEntry returns null when provider not in list" {
     // GAP-20c: When no entry matches, findProviderEntry returns null and
     // runTaskWithTools falls back to null for max_streaming_prompt_bytes,
@@ -262,6 +273,7 @@ test "buildSubagentSystemPrompt includes installed skills before tool instructio
         "You are a background subagent.",
         workspace_dir,
         no_tools[0..],
+        null,
     );
     defer allocator.free(prompt);
 

@@ -176,11 +176,11 @@ pub fn storeDigest(
 
 /// Preference signal keywords (Dutch + English).
 const preference_signals = [_][]const u8{
-    "ik wil",     "ik wilt",    "ik heb liever",  "ik prefereer",
-    "altijd",     "nooit",      "gebruik",         "niet meer",
-    "I want",     "I prefer",   "always",          "never",
-    "don't",      "please use", "stop using",      "switch to",
-    "liever in",  "graag in",   "voortaan",
+    "ik wil",    "ik wilt",    "ik heb liever", "ik prefereer",
+    "altijd",    "nooit",      "gebruik",       "niet meer",
+    "I want",    "I prefer",   "always",        "never",
+    "don't",     "please use", "stop using",    "switch to",
+    "liever in", "graag in",   "voortaan",
 };
 
 fn extractPreferences(allocator: std.mem.Allocator, content: []const u8, prefs: *std.ArrayListUnmanaged([]const u8)) !void {

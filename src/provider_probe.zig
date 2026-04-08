@@ -37,7 +37,7 @@ fn isLocalEndpoint(url: []const u8) bool {
     return net_security.isLocalHost(host);
 }
 
-fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
+pub fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
     return switch (providers.classifyProvider(provider_name)) {
         .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .openai_codex_provider => false,
         .compatible_provider => blk: {
@@ -365,6 +365,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.getProviderUserAgent(provider),
         cfg.getProviderApiMode(provider),
         cfg.getProviderMaxStreamingPromptBytes(provider),
+        cfg.getProviderChatTemplateEnableThinkingParam(provider),
     );
     defer holder.deinit();
 

@@ -402,7 +402,6 @@ pub const Agent = struct {
     /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
     evolution_tracker: ?*skillforge_evolution.SkillPerformanceTracker = null,
 
-
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     pub const OwnedMessage = struct {
         role: providers.Role,
@@ -1820,6 +1819,7 @@ pub const Agent = struct {
                 .matched_skill_out = if (self.skill_routing_enabled) &routed_skill else null,
                 .skill_affinity_history = if (self.skill_affinity_history) |*ah| ah else null,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+                .observer = self.observer,
             });
             // Store routed skill for turn-level attribution. Ownership transfers
             // to prev_turn_skill_owned; freed on next turn or agent deinit.
@@ -2731,6 +2731,7 @@ pub const Agent = struct {
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
         if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_append") and
             !std.mem.eql(u8, call.name, "file_edit") and
             !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
@@ -2823,6 +2824,14 @@ pub const Agent = struct {
         call: ParsedToolCall,
         result: ToolExecutionResult,
     ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
@@ -3938,6 +3947,10 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
         fn supportsVisionForModel(_: *anyopaque, model: []const u8) bool {
             return std.mem.eql(u8, model, "vision-model");
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -4015,6 +4028,10 @@ test "Agent buildProviderMessages allows workspace image paths" {
         fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
             return true;
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -4197,6 +4214,10 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy-test-provider";
         }
@@ -4257,6 +4278,8 @@ const RecordingObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = getName,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     fn observer(self: *Self) Observer {
@@ -4302,6 +4325,10 @@ const RecordingObserver = struct {
 
     fn flush(_: *anyopaque) void {}
 
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn getName(_: *anyopaque) []const u8 {
         return "recording-test";
     }
@@ -4406,6 +4433,10 @@ test "turn prepends profile system prompt when profile is active" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-profile-provider";
         }
@@ -4872,6 +4903,10 @@ test "turn bare /new routes through fresh-session prompt" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "echo-provider";
         }
@@ -4944,6 +4979,10 @@ test "turn /reset with argument stays slash-only command" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "nocall-provider";
         }
@@ -5008,6 +5047,10 @@ test "turn retains user message on provider error" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "fail-provider";
         }
@@ -5081,6 +5124,10 @@ test "turn does not retry immediately on rate limit" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "rate-limited-provider";
         }
@@ -5151,6 +5198,10 @@ test "turn still retries non-rate-limited provider failures once" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "retry-provider";
         }
@@ -5228,6 +5279,10 @@ test "turn records llm request for immediate context-compaction retry" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "recovery-provider";
         }
@@ -6131,6 +6186,10 @@ test "hard stop mock interruption lists exactly interrupted tool" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "one-shot-tool-provider";
         }
@@ -6301,6 +6360,10 @@ test "turn includes reasoning and usage footer when enabled" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6369,6 +6432,10 @@ test "turn estimates token usage when provider omits usage" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6437,6 +6504,10 @@ test "turn refreshes system prompt after workspace markdown change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6524,6 +6595,10 @@ test "turn refreshes system prompt after TOOLS.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6611,6 +6686,10 @@ test "turn refreshes system prompt after USER.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6698,6 +6777,10 @@ test "turn refreshes system prompt when conversation sender changes" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -7250,6 +7333,10 @@ test "turn passes auto-routed model to provider" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-provider";
         }
@@ -7320,6 +7407,11 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
         .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_append_match = [_]ParsedToolCall{
+        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
 
     const calls_no_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
@@ -7424,6 +7516,27 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
 
+test "rememberToolCallResultInTurn skips failed signature-only calls" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const failed_call = ParsedToolCall{
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"missing.txt\"}",
+        .tool_call_id = null,
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+        .name = failed_call.name,
+        .output = "FileNotFound",
+        .success = false,
+        .tool_call_id = null,
+    });
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+}
+
 test "Agent turn skips replayed tool_call_id across iterations" {
     const ProbeTool = struct {
         const Self = @This();
@@ -7484,6 +7597,10 @@ test "Agent turn skips replayed tool_call_id across iterations" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "replay-provider";
         }
@@ -7632,6 +7749,10 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -7759,6 +7880,10 @@ test "Agent tool-limit summary preserves provider session_id" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "session-capture-provider";
         }
@@ -7876,6 +8001,10 @@ test "Agent tool-limit summary records observer events and token metric" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-provider";
         }
@@ -7996,6 +8125,10 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-fail-provider";
         }
@@ -8093,6 +8226,10 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -8211,6 +8348,10 @@ test "Agent tool loop frees dynamic tool outputs" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -8350,6 +8491,10 @@ test "Agent shell failure with normalized output does not poison next turn" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "shell-failure-provider";
         }
@@ -8463,6 +8608,10 @@ test "Agent strips fabricated tool_result blocks from XML assistant history" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "xml-fabrication-provider";
         }
@@ -8598,6 +8747,10 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
             return error.ShouldNotStream;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "stream-guard";
         }
@@ -8763,6 +8916,10 @@ test "Agent retries empty final response once before succeeding" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-provider";
         }
@@ -8832,6 +8989,10 @@ test "Agent returns NoResponseContent after repeated empty final responses" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "always-empty-provider";
         }
@@ -8935,6 +9096,10 @@ test "Agent retries empty streaming response once" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-streaming-provider";
         }
@@ -9068,6 +9233,10 @@ test "Agent forces follow-through retry for streaming deferred promise" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "deferred-promise-streaming-provider";
         }
