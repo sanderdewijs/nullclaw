@@ -2299,6 +2299,38 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Webhooks ingress
+    if (root.get("webhooks")) |wh| {
+        if (wh == .object) {
+            if (wh.object.get("routes")) |routes_val| {
+                if (routes_val == .array) {
+                    var routes = std.ArrayListUnmanaged(types.WebhookIngressRoute){};
+                    for (routes_val.array.items) |item| {
+                        if (item != .object) continue;
+                        var route = types.WebhookIngressRoute{};
+                        if (item.object.get("route_id")) |v| if (v == .string) {
+                            route.route_id = try self.allocator.dupe(u8, v.string);
+                        };
+                        if (item.object.get("secret")) |v| if (v == .string) {
+                            route.secret = try self.allocator.dupe(u8, v.string);
+                        };
+                        if (item.object.get("prompt")) |v| if (v == .string) {
+                            route.prompt = try self.allocator.dupe(u8, v.string);
+                        };
+                        if (item.object.get("session_target")) |v| if (v == .string) {
+                            route.session_target = try self.allocator.dupe(u8, v.string);
+                        };
+                        if (item.object.get("rate_limit")) |v| if (v == .integer) {
+                            route.rate_limit = @intCast(v.integer);
+                        };
+                        try routes.append(self.allocator, route);
+                    }
+                    self.webhooks.routes = try routes.toOwnedSlice(self.allocator);
+                }
+            }
+        }
+    }
+
     // Tunnel
     if (root.get("tunnel")) |tun| {
         if (tun == .object) {

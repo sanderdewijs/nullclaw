@@ -232,6 +232,7 @@ pub const Config = struct {
     security: SecurityConfig = .{},
     tools: ToolsConfig = .{},
     subagent: SubagentConfig = .{},
+    webhooks: config_types.WebhookIngressConfig = .{},
     session: SessionConfig = .{},
 
     // Convenience aliases for backward-compat flat access used by other modules.

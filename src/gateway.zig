@@ -2383,6 +2383,96 @@ fn userFacingAgentErrorJson(err: anyerror) []const u8 {
     };
 }
 
+// ── Webhook Ingress handler ─────────────────────────────────────
+
+const WebhookIngressResult = struct {
+    status: []const u8,
+    body: []const u8,
+};
+
+fn handleWebhookIngress(
+    _: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    raw: []const u8,
+    route_id: []const u8,
+    config_opt: ?*const Config,
+    state: *GatewayState,
+    session_mgr: ?*session_mod.SessionManager,
+) WebhookIngressResult {
+    const cfg = config_opt orelse return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"no config\"}" };
+
+    // Find matching route
+    const route = blk: {
+        for (cfg.webhooks.routes) |r| {
+            if (std.mem.eql(u8, r.route_id, route_id)) break :blk r;
+        }
+        break :blk null;
+    } orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown route\"}" };
+
+    // Rate limit
+    if (!state.rate_limiter.allowWebhook(state.allocator, route_id)) {
+        return .{ .status = "429 Too Many Requests", .body = "{\"error\":\"rate limited\"}" };
+    }
+
+    // Auth: validate bearer token against route secret
+    if (route.secret.len > 0) {
+        const auth_header = extractHeader(raw, "Authorization");
+        const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+        const token = bearer orelse return .{ .status = "401 Unauthorized", .body = "{\"error\":\"missing bearer token\"}" };
+        if (!constantTimeEq(token, route.secret)) {
+            return .{ .status = "401 Unauthorized", .body = "{\"error\":\"invalid token\"}" };
+        }
+    }
+
+    // Extract body
+    const body = extractBody(raw) orelse "";
+
+    // Build prompt by replacing {{body}} in template
+    const prompt = if (route.prompt.len > 0) blk: {
+        if (std.mem.indexOf(u8, route.prompt, "{{body}}")) |idx| {
+            break :blk std.fmt.allocPrint(req_allocator, "{s}{s}{s}", .{
+                route.prompt[0..idx],
+                body,
+                route.prompt[idx + "{{body}}".len ..],
+            }) catch route.prompt;
+        }
+        break :blk route.prompt;
+    } else body;
+
+    if (prompt.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty prompt\"}" };
+    }
+
+    // Dispatch to agent — try session manager first, fall back to subprocess
+    if (session_mgr) |sm| {
+        const session_key = std.fmt.allocPrint(req_allocator, "webhook:{s}", .{route_id}) catch
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc failed\"}" };
+
+        _ = sm.processMessage(session_key, prompt, null) catch |err| {
+            std.log.scoped(.gateway).warn("webhook ingress '{s}' session error: {s}", .{ route_id, @errorName(err) });
+        };
+        return .{ .status = "200 OK", .body = "{\"ok\":true}" };
+    }
+
+    // Fallback: spawn nullclaw agent subprocess (daemon mode without local session manager)
+    spawnAgentSubprocess(req_allocator, prompt);
+    return .{ .status = "202 Accepted", .body = "{\"ok\":true,\"note\":\"dispatched via subprocess\"}" };
+}
+
+/// Fire-and-forget agent subprocess for webhook dispatch in daemon mode.
+fn spawnAgentSubprocess(allocator: std.mem.Allocator, prompt: []const u8) void {
+    // Heap-dupe prompt so it outlives this function (child reads it after return).
+    const owned_prompt = allocator.dupe(u8, prompt) catch return;
+
+    const argv = [_][]const u8{ "nullclaw", "agent", "-m", owned_prompt };
+    var child = std.process.Child.init(&argv, allocator);
+    child.spawn() catch |err| {
+        std.log.scoped(.gateway).warn("webhook agent spawn failed: {s}", .{@errorName(err)});
+        return;
+    };
+    // Intentionally detached — child runs independently.
+}
+
 const WebhookHandlerContext = struct {
     root_allocator: std.mem.Allocator,
     req_allocator: std.mem.Allocator,
@@ -5482,6 +5572,21 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 response_content_type = cron_ctx.response_content_type;
                 response_body = cron_ctx.response_body;
             }
+        } else if (std.mem.startsWith(u8, base_path, "/hooks/") and is_post) {
+            // ── Webhook Ingress: /hooks/{route_id} ──
+            // Accepts POST with bearer auth, dispatches body as agent prompt.
+            const route_id = base_path["/hooks/".len..];
+            const hook_result = handleWebhookIngress(
+                allocator,
+                req_allocator,
+                raw,
+                route_id,
+                config_opt,
+                &state,
+                if (session_mgr_opt) |*sm| sm else null,
+            );
+            response_status = hook_result.status;
+            response_body = hook_result.body;
         } else if (findWebhookRouteDescriptor(base_path)) |desc| {
             var webhook_ctx = WebhookHandlerContext{
                 .root_allocator = allocator,

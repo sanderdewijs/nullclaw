@@ -1380,6 +1380,25 @@ pub const MemoryDreamingConfig = struct {
     timezone: []const u8 = "",
 };
 
+// ── Webhook Ingress config ──────────────────────────────────────
+
+pub const WebhookIngressRoute = struct {
+    /// Route path suffix (e.g., "coding-complete" → /hooks/coding-complete).
+    route_id: []const u8 = "",
+    /// Shared secret for bearer token auth.
+    secret: []const u8 = "",
+    /// Agent prompt template. {{body}} is replaced with the POST body.
+    prompt: []const u8 = "",
+    /// Session target: "main" routes to Donna's main session, "isolated" spawns a new one.
+    session_target: []const u8 = "main",
+    /// Rate limit (requests per minute).
+    rate_limit: u32 = 30,
+};
+
+pub const WebhookIngressConfig = struct {
+    routes: []const WebhookIngressRoute = &.{},
+};
+
 // ── Tunnel config ───────────────────────────────────────────────
 
 // Re-export tunnel config types from tunnel.zig so config parsing stays
