@@ -450,7 +450,7 @@ fn alignToNextMinute(from_secs: i64) i64 {
     return start + (60 - rem);
 }
 
-fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+pub fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
     const parsed = try parseCronExpression(expression);
     var candidate = alignToNextMinute(from_secs);
 

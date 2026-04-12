@@ -25,6 +25,7 @@ const MemoryCategory = root.MemoryCategory;
 const dream_state = @import("dream_state.zig");
 const DreamState = dream_state.DreamState;
 const temporal_decay = @import("../retrieval/temporal_decay.zig");
+const cron = @import("../../cron.zig");
 const log = std.log.scoped(.dreaming);
 
 // ── Configuration ────────────────────────────────────────────────
@@ -56,8 +57,24 @@ const MIN_UNIQUE_QUERIES: u32 = 3;
 
 // ── Cadence ──────────────────────────────────────────────────────
 
-/// Default minimum interval between dream cycles (6 hours).
-const DREAM_INTERVAL_SECS: i64 = 6 * 60 * 60;
+/// Fallback cadence (24h) if the configured cron expression cannot be parsed.
+/// The cron path is the primary mechanism; this only kicks in when
+/// `config.frequency` is malformed so we still make forward progress.
+const DREAM_FALLBACK_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// Return true when the configured cron schedule says another dream cycle is
+/// due. Uses the same 5-field expression parser as the main cron scheduler, so
+/// semantics match (UTC-interpreted; the `timezone` config field is accepted
+/// but not yet honored — same limitation as scheduled cron jobs).
+fn cronCycleDue(expression: []const u8, last_run_at: i64, now: i64) bool {
+    if (last_run_at <= 0) return true; // never run before
+    const next = cron.nextRunForCronExpression(expression, last_run_at) catch {
+        // Malformed expression: fall back to a fixed 24h interval so we keep
+        // running (and the user still gets dream cycles) instead of stalling.
+        return (now -% last_run_at) >= DREAM_FALLBACK_INTERVAL_SECS;
+    };
+    return now >= next;
+}
 
 // ── Report ───────────────────────────────────────────────────────
 
@@ -93,9 +110,9 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: DreamingConfig, mem: ?Memo
     };
     defer state.deinit();
 
-    // Check cadence
+    // Check cadence against the configured cron expression.
     const now = std.time.timestamp();
-    if (state.last_run_at > 0 and (now -% state.last_run_at) < DREAM_INTERVAL_SECS) {
+    if (!cronCycleDue(config.frequency, state.last_run_at, now)) {
         return .{ .skipped = true, .skip_reason = "too soon" };
     }
 
@@ -390,6 +407,32 @@ test "computeScore returns weighted score" {
     // Score should be reasonably high given good signals
     try std.testing.expect(score > 0.5);
     try std.testing.expect(score <= 1.0);
+}
+
+test "cronCycleDue fires exactly once per daily window" {
+    // "0 23 * * *" = every day at 23:00 UTC. Pick a last_run anchored at that
+    // minute so we can step forward in predictable increments.
+    const one_hour: i64 = 3600;
+    const one_day: i64 = 24 * one_hour;
+
+    // Anchor: 2026-01-01T23:00:00Z — verified below with the parser itself.
+    const anchor: i64 = cron.nextRunForCronExpression("0 23 * * *", 1_767_306_000) catch unreachable;
+
+    // 1 hour after: not yet due (next fire is +24h).
+    try std.testing.expect(!cronCycleDue("0 23 * * *", anchor, anchor + one_hour));
+    // Exactly +24h after last run: due.
+    try std.testing.expect(cronCycleDue("0 23 * * *", anchor, anchor + one_day));
+    // Never-run state should always fire.
+    try std.testing.expect(cronCycleDue("0 23 * * *", 0, anchor));
+}
+
+test "cronCycleDue falls back gracefully on malformed expression" {
+    const one_hour: i64 = 3600;
+    const one_day: i64 = 24 * one_hour;
+    // 1 hour after last_run: not yet due under the 24h fallback.
+    try std.testing.expect(!cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_hour));
+    // A full day later: due.
+    try std.testing.expect(cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_day));
 }
 
 test "isInternalKey filters bootstrap and internal keys" {
