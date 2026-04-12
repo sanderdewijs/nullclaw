@@ -1859,16 +1859,52 @@ fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]
     return config_paths.pathFromConfigDir(allocator, config_dir, "cron.json");
 }
 
+/// Test-only override for the config directory. When set, `cronJsonPath` and
+/// `ensureCronDir` resolve against this path instead of `~/.nullclaw`, so tests
+/// never clobber the developer's real cron.json.
+var test_config_dir_override: ?[]const u8 = null;
+
+/// Auto-provisioned per-process tmp dir used when a test forgot to set an
+/// explicit override. Prevents any `saveJobs` / `loadJobs` call reached via
+/// `.execute()` on a cron tool from reaching the real `~/.nullclaw`.
+var test_default_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+var test_default_dir: ?[]const u8 = null;
+
+pub fn setTestConfigDir(dir: ?[]const u8) void {
+    test_config_dir_override = dir;
+}
+
+fn ensureTestDefaultDir() ![]const u8 {
+    if (test_default_dir) |d| return d;
+    const pid = std.os.linux.getpid();
+    const p = try std.fmt.bufPrint(&test_default_dir_buf, "/tmp/nullclaw-cron-test-{d}", .{pid});
+    std.fs.makeDirAbsolute(p) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    test_default_dir = p;
+    return p;
+}
+
+fn resolveConfigDir(allocator: std.mem.Allocator) ![]u8 {
+    if (test_config_dir_override) |dir| return allocator.dupe(u8, dir);
+    if (builtin.is_test) {
+        const dir = try ensureTestDefaultDir();
+        return allocator.dupe(u8, dir);
+    }
+    return config_paths.defaultConfigDir(allocator);
+}
+
 /// Get the cron.json path inside the config directory.
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
-    const dir = try config_paths.defaultConfigDir(allocator);
+    const dir = try resolveConfigDir(allocator);
     defer allocator.free(dir);
     return cronJsonPathFromDir(allocator, dir);
 }
 
 /// Ensure the config directory exists.
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
-    const dir = try config_paths.defaultConfigDir(allocator);
+    const dir = try resolveConfigDir(allocator);
     defer allocator.free(dir);
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -3004,6 +3040,13 @@ test "CronScheduler getJob found and missing" {
 }
 
 test "save and load roundtrip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3036,6 +3079,13 @@ test "save and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3058,6 +3108,13 @@ test "load agent job without command field falls back to prompt" {
 }
 
 test "load agent job without prompt field falls back to command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3088,6 +3145,13 @@ test "trimOwnedRight duplicates trimmed allocation" {
 }
 
 test "save and load roundtrip keeps delivery account routing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3124,6 +3188,13 @@ test "save and load roundtrip keeps delivery account routing" {
 }
 
 test "cliRunJob persists last status and timestamp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3156,6 +3227,13 @@ test "resolveRunnableCwd returns null for missing cwd" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
@@ -3183,6 +3261,13 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 }
 
 test "save and load roundtrip with JSON-sensitive command characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -3199,6 +3284,13 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 }
 
 test "save and load roundtrip keeps agent fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
