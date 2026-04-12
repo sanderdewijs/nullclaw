@@ -64,11 +64,11 @@ const DREAM_FALLBACK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// Return true when the configured cron schedule says another dream cycle is
 /// due. Uses the same 5-field expression parser as the main cron scheduler, so
-/// semantics match (UTC-interpreted; the `timezone` config field is accepted
-/// but not yet honored — same limitation as scheduled cron jobs).
-fn cronCycleDue(expression: []const u8, last_run_at: i64, now: i64) bool {
+/// semantics match. `offset_secs` shifts the expression's interpretation into a
+/// local timezone (e.g. +7200 for CEST); 0 = UTC.
+fn cronCycleDue(expression: []const u8, last_run_at: i64, now: i64, offset_secs: i64) bool {
     if (last_run_at <= 0) return true; // never run before
-    const next = cron.nextRunForCronExpression(expression, last_run_at) catch {
+    const next = cron.nextRunForCronExpressionWithOffset(expression, last_run_at, offset_secs) catch {
         // Malformed expression: fall back to a fixed 24h interval so we keep
         // running (and the user still gets dream cycles) instead of stalling.
         return (now -% last_run_at) >= DREAM_FALLBACK_INTERVAL_SECS;
@@ -110,9 +110,10 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: DreamingConfig, mem: ?Memo
     };
     defer state.deinit();
 
-    // Check cadence against the configured cron expression.
+    // Check cadence against the configured cron expression in the configured TZ.
     const now = std.time.timestamp();
-    if (!cronCycleDue(config.frequency, state.last_run_at, now)) {
+    const tz_offset = cron.timezoneOffsetSecs(allocator, config.timezone);
+    if (!cronCycleDue(config.frequency, state.last_run_at, now, tz_offset)) {
         return .{ .skipped = true, .skip_reason = "too soon" };
     }
 
@@ -419,20 +420,20 @@ test "cronCycleDue fires exactly once per daily window" {
     const anchor: i64 = cron.nextRunForCronExpression("0 23 * * *", 1_767_306_000) catch unreachable;
 
     // 1 hour after: not yet due (next fire is +24h).
-    try std.testing.expect(!cronCycleDue("0 23 * * *", anchor, anchor + one_hour));
+    try std.testing.expect(!cronCycleDue("0 23 * * *", anchor, anchor + one_hour, 0));
     // Exactly +24h after last run: due.
-    try std.testing.expect(cronCycleDue("0 23 * * *", anchor, anchor + one_day));
+    try std.testing.expect(cronCycleDue("0 23 * * *", anchor, anchor + one_day, 0));
     // Never-run state should always fire.
-    try std.testing.expect(cronCycleDue("0 23 * * *", 0, anchor));
+    try std.testing.expect(cronCycleDue("0 23 * * *", 0, anchor, 0));
 }
 
 test "cronCycleDue falls back gracefully on malformed expression" {
     const one_hour: i64 = 3600;
     const one_day: i64 = 24 * one_hour;
     // 1 hour after last_run: not yet due under the 24h fallback.
-    try std.testing.expect(!cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_hour));
+    try std.testing.expect(!cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_hour, 0));
     // A full day later: due.
-    try std.testing.expect(cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_day));
+    try std.testing.expect(cronCycleDue("nonsense", 1_000_000, 1_000_000 + one_day, 0));
 }
 
 test "isInternalKey filters bootstrap and internal keys" {

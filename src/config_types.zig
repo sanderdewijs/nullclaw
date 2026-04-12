@@ -200,6 +200,11 @@ pub const SchedulerConfig = struct {
     max_concurrent: u32 = 4,
     /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
     agent_timeout_secs: u64 = 0,
+    /// IANA timezone (e.g. "Europe/Amsterdam") used to interpret cron
+    /// expressions. Empty string = UTC. Honored as a static offset captured
+    /// at scheduler start — DST transitions that happen mid-run are not
+    /// tracked live (rarely matters; daemon restarts daily via cycle anyway).
+    timezone: []const u8 = "",
 };
 
 // ── Tool filter groups ──────────────────────────────────────────

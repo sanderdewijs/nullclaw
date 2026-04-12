@@ -476,6 +476,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
+    scheduler.setTimezoneOffsetSecs(cron.timezoneOffsetSecs(allocator, config.scheduler.timezone));
     defer scheduler.deinit();
     defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;

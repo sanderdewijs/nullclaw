@@ -451,15 +451,88 @@ fn alignToNextMinute(from_secs: i64) i64 {
 }
 
 pub fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+    return nextRunForCronExpressionWithOffset(expression, from_secs, 0);
+}
+
+/// Like `nextRunForCronExpression` but interprets the cron expression in a
+/// timezone offset from UTC (seconds east). `from_secs` and return value are
+/// both UTC epoch seconds.
+pub fn nextRunForCronExpressionWithOffset(expression: []const u8, from_secs: i64, offset_secs: i64) !i64 {
     const parsed = try parseCronExpression(expression);
-    var candidate = alignToNextMinute(from_secs);
+    // View the epoch as "local time" by adding the offset. `cronExpressionMatches`
+    // uses UTC-style wall-clock math, so a shifted epoch makes it match local
+    // hour/minute semantics. Shift back for the caller.
+    var candidate = alignToNextMinute(from_secs + offset_secs);
 
     var i: usize = 0;
     while (i < MAX_CRON_LOOKAHEAD_MINUTES) : (i += 1) {
-        if (cronExpressionMatches(&parsed, candidate)) return candidate;
+        if (cronExpressionMatches(&parsed, candidate)) return candidate - offset_secs;
         candidate += 60;
     }
     return error.NoFutureRunFound;
+}
+
+/// Return the current UTC offset (seconds east) for a named IANA timezone by
+/// shelling out to `date +%z` with TZ set. Empty name or any failure yields 0.
+/// Cached for ~1 hour so we don't fork a subprocess on every cron evaluation.
+var cached_tz_name: [64]u8 = undefined;
+var cached_tz_len: usize = 0;
+var cached_tz_offset: i64 = 0;
+var cached_tz_at: i64 = 0;
+
+pub fn timezoneOffsetSecs(allocator: std.mem.Allocator, tz_name: []const u8) i64 {
+    if (tz_name.len == 0) return 0;
+    const now = std.time.timestamp();
+    if (cached_tz_len == tz_name.len and
+        std.mem.eql(u8, cached_tz_name[0..cached_tz_len], tz_name) and
+        now - cached_tz_at < 3600)
+    {
+        return cached_tz_offset;
+    }
+    const out = runDateTz(allocator, tz_name) catch return 0;
+    defer allocator.free(out);
+    const offset = parseDateOffset(out) orelse return 0;
+    if (tz_name.len <= cached_tz_name.len) {
+        @memcpy(cached_tz_name[0..tz_name.len], tz_name);
+        cached_tz_len = tz_name.len;
+        cached_tz_offset = offset;
+        cached_tz_at = now;
+    }
+    return offset;
+}
+
+fn runDateTz(allocator: std.mem.Allocator, tz_name: []const u8) ![]u8 {
+    const tz_env = try std.fmt.allocPrint(allocator, "TZ={s}", .{tz_name});
+    defer allocator.free(tz_env);
+
+    var child = std.process.Child.init(&.{ "date", "+%z" }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    // Inherit parent env and override TZ — Zig 0.15 exposes this via env_map.
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TZ", tz_name);
+    child.env_map = &env_map;
+
+    try child.spawn();
+    const stdout = child.stdout.?;
+    const data = try stdout.readToEndAlloc(allocator, 64);
+    _ = child.wait() catch {};
+    return data;
+}
+
+/// Parse a `+HHMM` / `-HHMM` token (possibly followed by newline) into seconds east of UTC.
+fn parseDateOffset(raw: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len != 5) return null;
+    const sign: i64 = switch (trimmed[0]) {
+        '+' => 1,
+        '-' => -1,
+        else => return null,
+    };
+    const hh = std.fmt.parseInt(i64, trimmed[1..3], 10) catch return null;
+    const mm = std.fmt.parseInt(i64, trimmed[3..5], 10) catch return null;
+    return sign * (hh * 3600 + mm * 60);
 }
 
 /// In-memory cron job store (no SQLite dependency for the minimal Zig port).
@@ -474,6 +547,8 @@ pub const CronScheduler = struct {
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
     observer: ?observability.Observer = null,
+    /// Offset (seconds east of UTC) used to interpret cron expressions. 0 = UTC.
+    timezone_offset_secs: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -492,6 +567,10 @@ pub const CronScheduler = struct {
 
     pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
         self.agent_timeout_secs = timeout_secs;
+    }
+
+    pub fn setTimezoneOffsetSecs(self: *CronScheduler, offset_secs: i64) void {
+        self.timezone_offset_secs = offset_secs;
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -556,7 +635,7 @@ pub const CronScheduler = struct {
         // Validate expression
         _ = try normalizeExpression(expression);
         const now = std.time.timestamp();
-        const next_run_secs = try nextRunForCronExpression(expression, now);
+        const next_run_secs = try nextRunForCronExpressionWithOffset(expression, now, self.timezone_offset_secs);
 
         const id = try self.allocateJobId("job");
         errdefer self.allocator.free(id);
@@ -601,7 +680,7 @@ pub const CronScheduler = struct {
 
         _ = try normalizeExpression(expression);
         const now = std.time.timestamp();
-        const next_run_secs = try nextRunForCronExpression(expression, now);
+        const next_run_secs = try nextRunForCronExpressionWithOffset(expression, now, self.timezone_offset_secs);
 
         const id = try self.allocateJobId("agent");
         errdefer self.allocator.free(id);
@@ -701,7 +780,7 @@ pub const CronScheduler = struct {
     pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
         const job = self.getMutableJob(id) orelse return false;
         if (patch.expression) |expr| {
-            const next_run_secs = nextRunForCronExpression(expr, std.time.timestamp()) catch return false;
+            const next_run_secs = nextRunForCronExpressionWithOffset(expr, std.time.timestamp(), self.timezone_offset_secs) catch return false;
             const new_expr = allocator.dupe(u8, expr) catch return false;
             allocator.free(job.expression);
             job.expression = new_expr;
@@ -957,7 +1036,7 @@ pub const CronScheduler = struct {
                     job.paused = true;
                 };
             } else {
-                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                job.next_run_secs = nextRunForCronExpressionWithOffset(job.expression, now, self.timezone_offset_secs) catch |err| blk: {
                     log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
                     break :blk now + 60;
                 };
@@ -1140,7 +1219,7 @@ pub const CronScheduler = struct {
                     job.paused = true;
                 };
             } else {
-                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                job.next_run_secs = nextRunForCronExpressionWithOffset(job.expression, now, self.timezone_offset_secs) catch |err| blk: {
                     log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
                     break :blk now + 60;
                 };
@@ -2953,6 +3032,26 @@ test "nextRunForCronExpression supports sunday aliases 0 and 7" {
     const next_sun_zero = try nextRunForCronExpression("0 0 * * 0", 0);
     const next_sun_seven = try nextRunForCronExpression("0 0 * * 7", 0);
     try std.testing.expectEqual(next_sun_zero, next_sun_seven);
+}
+
+test "nextRunForCronExpressionWithOffset shifts by timezone" {
+    // UTC-interpreted: "0 23 * * *" after epoch 0 fires at 23:00 UTC = 82800s.
+    const utc = try nextRunForCronExpressionWithOffset("0 23 * * *", 0, 0);
+    try std.testing.expectEqual(@as(i64, 82800), utc);
+    // +7200 offset (CEST): "0 23 local" = 21:00 UTC = 75600s.
+    const cest = try nextRunForCronExpressionWithOffset("0 23 * * *", 0, 7200);
+    try std.testing.expectEqual(@as(i64, 75600), cest);
+    // -18000 offset (EST): "0 23 local" = 04:00 next-day UTC = 86400+14400.
+    const est = try nextRunForCronExpressionWithOffset("0 23 * * *", 0, -18000);
+    try std.testing.expectEqual(@as(i64, 100800), est);
+}
+
+test "parseDateOffset handles positive and negative offsets" {
+    try std.testing.expectEqual(@as(?i64, 7200), parseDateOffset("+0200\n"));
+    try std.testing.expectEqual(@as(?i64, -18000), parseDateOffset("-0500"));
+    try std.testing.expectEqual(@as(?i64, 0), parseDateOffset("+0000"));
+    try std.testing.expectEqual(@as(?i64, null), parseDateOffset("bogus"));
+    try std.testing.expectEqual(@as(?i64, null), parseDateOffset(""));
 }
 
 test "nextRunForCronExpression handles leap-day schedules beyond one year" {

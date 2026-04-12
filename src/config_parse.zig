@@ -1278,6 +1278,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (sch.object.get("agent_timeout_secs")) |v| {
                 if (v == .integer and v.integer >= 0) self.scheduler.agent_timeout_secs = @intCast(v.integer);
             }
+            if (sch.object.get("timezone")) |v| {
+                if (v == .string) self.scheduler.timezone = try self.allocator.dupe(u8, v.string);
+            }
         }
     }
 
