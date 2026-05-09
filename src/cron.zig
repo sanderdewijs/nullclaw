@@ -2518,6 +2518,9 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
 
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2595,6 +2598,9 @@ pub fn cliAddAgentJob(
         }
     }
 
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2622,6 +2628,9 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
+
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
@@ -2664,6 +2673,9 @@ pub fn cliAddAgentOnce(
         if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
 
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2690,6 +2702,9 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
         if (gatewayPost(allocator, url, "/cron/remove", body_buf.items)) return;
     }
 
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2714,6 +2729,9 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
         if (gatewayPost(allocator, url, "/cron/pause", body_buf.items)) return;
     }
 
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -2737,6 +2755,9 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/resume", body_buf.items)) return;
     }
+
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
@@ -2765,6 +2786,9 @@ fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
@@ -2872,6 +2896,9 @@ pub fn cliUpdateJob(
         body_buf.appendSlice(allocator, "}") catch {};
         if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
     }
+
+    var lock = try acquireCronStoreLock(allocator);
+    defer lock.release();
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
@@ -3212,6 +3239,57 @@ test "save and load roundtrip" {
     try std.testing.expect(loaded[0].last_status != null);
     try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "acquireCronStoreLock creates sidecar file and releases cleanly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
+    {
+        var lock = try acquireCronStoreLock(std.testing.allocator);
+        defer lock.release();
+
+        const lock_path = try cronStoreLockPath(std.testing.allocator);
+        defer std.testing.allocator.free(lock_path);
+        try std.fs.accessAbsolute(lock_path, .{});
+    }
+
+    var lock2 = try acquireCronStoreLock(std.testing.allocator);
+    lock2.release();
+}
+
+test "acquireCronStoreLock serializes concurrent waiters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
+    var first = try acquireCronStoreLock(std.testing.allocator);
+
+    var thread_acquired = std.atomic.Value(bool).init(false);
+
+    const Worker = struct {
+        fn run(flag: *std.atomic.Value(bool), alloc: std.mem.Allocator) void {
+            var second = acquireCronStoreLock(alloc) catch return;
+            defer second.release();
+            flag.store(true, .release);
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &thread_acquired, std.testing.allocator });
+
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try std.testing.expect(!thread_acquired.load(.acquire));
+
+    first.release();
+    thread.join();
+    try std.testing.expect(thread_acquired.load(.acquire));
 }
 
 test "load agent job without command field falls back to prompt" {
