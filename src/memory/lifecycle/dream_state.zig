@@ -22,6 +22,9 @@ pub const DreamState = struct {
     query_diversity: std.StringHashMapUnmanaged(SessionSet) = .{},
     /// Per-key count of dream cycles the entry has survived promotion.
     consolidation_counts: std.StringHashMapUnmanaged(u64) = .{},
+    /// Per-key retrieval-feedback trust score in [0.0, 1.0]. Default 0.5 when
+    /// missing. Bumps on each recall event; never auto-decays (opt-in).
+    trust_scores: std.StringHashMapUnmanaged(f64) = .{},
     /// Keys that have been promoted to MEMORY.md / .core category.
     promoted_keys: std.StringHashMapUnmanaged(void) = .{},
     /// Arena that owns all heap-allocated strings in the maps above.
@@ -65,13 +68,14 @@ pub fn load(allocator: std.mem.Allocator, workspace_dir: []const u8) !DreamState
     const dir_path = try dreamsDir(allocator, workspace_dir);
     defer allocator.free(dir_path);
 
-    const dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
+    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return DreamState{},
         else => {
             log.warn("failed to open dreams dir: {}", .{err});
             return DreamState{};
         },
     };
+    defer dir.close();
 
     const contents = fs_compat.readFileAlloc(dir, allocator, "state.json", 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return DreamState{},
@@ -149,6 +153,21 @@ fn parseState(parent_allocator: std.mem.Allocator, json_bytes: []const u8) !Drea
                     const key = try allocator.dupe(u8, k);
                     try state.consolidation_counts.put(allocator, key, @intCast(@max(0, val.integer)));
                 }
+            }
+        }
+    }
+
+    // Parse trust_scores: { "key": float }
+    if (obj.get("trust_scores")) |v| {
+        if (v == .object) {
+            for (v.object.keys(), v.object.values()) |k, val| {
+                const score: f64 = switch (val) {
+                    .float => |f| f,
+                    .integer => |i| @floatFromInt(i),
+                    else => continue,
+                };
+                const key = try allocator.dupe(u8, k);
+                try state.trust_scores.put(allocator, key, score);
             }
         }
     }
@@ -249,6 +268,20 @@ pub fn save(allocator: std.mem.Allocator, workspace_dir: []const u8, state: *con
     if (state.consolidation_counts.count() > 0) try writer.writeAll("\n  ");
     try writer.writeAll("},\n");
 
+    // trust_scores
+    try writer.writeAll("  \"trust_scores\": {");
+    {
+        var first = true;
+        var it = state.trust_scores.iterator();
+        while (it.next()) |entry| {
+            if (!first) try writer.writeAll(",");
+            try std.fmt.format(writer, "\n    \"{s}\": {d:.4}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            first = false;
+        }
+    }
+    if (state.trust_scores.count() > 0) try writer.writeAll("\n  ");
+    try writer.writeAll("},\n");
+
     // promoted_keys
     try writer.writeAll("  \"promoted_keys\": [");
     {
@@ -285,12 +318,25 @@ pub fn appendRecallEvent(allocator: std.mem.Allocator, workspace_dir: []const u8
     const path = recallLogPath(allocator, workspace_dir) catch return;
     defer allocator.free(path);
 
-    // Ensure directory exists
+    // Ensure directory exists (create full parent chain if needed)
     const dir = dreamsDir(allocator, workspace_dir) catch return;
     defer allocator.free(dir);
+    // First try the fast path (dir already exists)
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => return,
+        else => {
+            // Parent missing — create the full chain: workspace/memory/.dreams
+            const memory_dir = std.fs.path.join(allocator, &.{ workspace_dir, "memory" }) catch return;
+            defer allocator.free(memory_dir);
+            std.fs.makeDirAbsolute(memory_dir) catch |e2| switch (e2) {
+                error.PathAlreadyExists => {},
+                else => return,
+            };
+            std.fs.makeDirAbsolute(dir) catch |e3| switch (e3) {
+                error.PathAlreadyExists => {},
+                else => return,
+            };
+        },
     };
 
     const line = std.fmt.allocPrint(allocator, "{{\"key\":\"{s}\",\"session_id\":\"{s}\",\"ts\":{d}}}\n", .{
@@ -322,10 +368,11 @@ pub fn consumeRecallLog(allocator: std.mem.Allocator, workspace_dir: []const u8)
     const dir_path = try dreamsDir(allocator, workspace_dir);
     defer allocator.free(dir_path);
 
-    const dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
+    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc(RecallEvent, 0),
         else => return err,
     };
+    defer dir.close();
 
     const contents = fs_compat.readFileAlloc(dir, allocator, "recall_log.jsonl", 4 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc(RecallEvent, 0),
@@ -413,6 +460,9 @@ test "DreamState save and load roundtrip" {
     const pkey = try arena.dupe(u8, "promoted_1");
     try state.promoted_keys.put(arena, pkey, {});
 
+    const tkey = try arena.dupe(u8, "test_key");
+    try state.trust_scores.put(arena, tkey, 0.6500);
+
     try save(allocator, tmp_path, &state);
 
     var loaded = try load(allocator, tmp_path);
@@ -424,6 +474,7 @@ test "DreamState save and load roundtrip" {
     try std.testing.expectEqual(@as(u64, 3), loaded.recall_counts.get("test_key").?);
     try std.testing.expectEqual(@as(u64, 2), loaded.consolidation_counts.get("test_key").?);
     try std.testing.expect(loaded.promoted_keys.contains("promoted_1"));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.65), loaded.trust_scores.get("test_key").?, 1e-4);
 
     const diversity = loaded.query_diversity.get("test_key").?;
     try std.testing.expectEqual(@as(u32, 2), diversity.count());

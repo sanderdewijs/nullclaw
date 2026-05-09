@@ -24,7 +24,6 @@ const MemoryEntry = root.MemoryEntry;
 const MemoryCategory = root.MemoryCategory;
 const dream_state = @import("dream_state.zig");
 const DreamState = dream_state.DreamState;
-const temporal_decay = @import("../retrieval/temporal_decay.zig");
 const cron = @import("../../cron.zig");
 const log = std.log.scoped(.dreaming);
 
@@ -45,15 +44,33 @@ pub const DreamingConfig = struct {
 const WEIGHT_RELEVANCE: f64 = 0.30;
 const WEIGHT_FREQUENCY: f64 = 0.24;
 const WEIGHT_QUERY_DIVERSITY: f64 = 0.15;
-const WEIGHT_RECENCY: f64 = 0.15;
+const WEIGHT_TRUST: f64 = 0.15;
 const WEIGHT_CONSOLIDATION: f64 = 0.10;
 const WEIGHT_RICHNESS: f64 = 0.06;
 
+// ── Trust-score retrieval feedback ───────────────────────────────
+
+/// Initial trust assigned to a key on its first observed recall. Mirrors the
+/// Hermes Holographic store's neutral baseline.
+const TRUST_DEFAULT: f64 = 0.5;
+/// Increment per recall event. Asymmetric with the (currently unused) penalty
+/// so that occasional retrieval pulls trust upward, in line with the Hermes
+/// pattern of `_HELPFUL_DELTA = 0.05`.
+const TRUST_DELTA_HELPFUL: f64 = 0.05;
+const TRUST_MIN: f64 = 0.0;
+const TRUST_MAX: f64 = 1.0;
+
 // ── Promotion thresholds ─────────────────────────────────────────
 
-const MIN_SCORE: f64 = 0.8;
+// 2026-05-09: 14-day recency half-life was the structural bottleneck — old
+// archive entries decayed below the bar before recall could lift them. Replaced
+// with a trust-score retrieval-feedback signal (Hermes Holographic pattern):
+// every recall bumps per-key trust by TRUST_DELTA_HELPFUL with no automatic
+// time decay, so frequently-recalled memories climb back into promotion range
+// regardless of age. MIN_SCORE stays at 0.7 as the validated bar.
+const MIN_SCORE: f64 = 0.7;
 const MIN_RECALL_COUNT: u64 = 3;
-const MIN_UNIQUE_QUERIES: u32 = 3;
+const MIN_UNIQUE_QUERIES: u32 = 2;
 
 // ── Cadence ──────────────────────────────────────────────────────
 
@@ -195,6 +212,14 @@ fn runLightPhase(allocator: std.mem.Allocator, workspace_dir: []const u8, state:
             const key = arena.dupe(u8, event.key) catch continue;
             state.query_diversity.put(arena, key, set) catch continue;
         }
+
+        // Bump trust score: retrieval is a positive signal for this memory.
+        if (state.trust_scores.getPtr(event.key)) |trust| {
+            trust.* = @min(TRUST_MAX, trust.* + TRUST_DELTA_HELPFUL);
+        } else {
+            const key = arena.dupe(u8, event.key) catch continue;
+            state.trust_scores.put(arena, key, TRUST_DEFAULT + TRUST_DELTA_HELPFUL) catch continue;
+        }
     }
 
     return events.len;
@@ -271,8 +296,11 @@ fn runDeepPhase(allocator: std.mem.Allocator, mem: Memory, state: *DreamState, n
 
 /// Compute weighted dream score for a single entry.
 fn computeScore(entry: MemoryEntry, state: *const DreamState, now: i64) f64 {
-    // Relevance: use existing score from retrieval engine, normalized to [0,1]
-    const relevance = if (entry.score) |s| @min(1.0, @max(0.0, s)) else 0.5;
+    // Relevance: use existing score from retrieval engine, normalized to [0,1].
+    // mem.list() does not run retrieval, so .score is always null in the dream
+    // path — fall back to 1.0 so usage signals (frequency, diversity, recency)
+    // determine ranking instead of being capped by a synthetic 0.5 floor.
+    const relevance = if (entry.score) |s| @min(1.0, @max(0.0, s)) else 1.0;
 
     // Frequency: recall count, saturating at 10
     const recall_count = state.recall_counts.get(entry.key) orelse 0;
@@ -285,11 +313,9 @@ fn computeScore(entry: MemoryEntry, state: *const DreamState, now: i64) f64 {
         0;
     const diversity = @min(1.0, @as(f64, @floatFromInt(unique_sessions)) / 5.0);
 
-    // Recency: temporal decay with 14-day half-life
-    const ts = parseTimestamp(entry.timestamp);
-    const age_secs_raw = now -% ts;
-    const age_days: f64 = if (age_secs_raw < 0) 0.0 else @as(f64, @floatFromInt(age_secs_raw)) / 86400.0;
-    const recency = temporal_decay.decayMultiplier(age_days, 14);
+    // Trust: retrieval-feedback signal. Defaults to TRUST_DEFAULT for keys
+    // never seen by the recall log; bumps in light sleep on each recall.
+    const trust = state.trust_scores.get(entry.key) orelse TRUST_DEFAULT;
 
     // Consolidation: number of dream cycles survived, saturating at 10
     const consol_count = state.consolidation_counts.get(entry.key) orelse 0;
@@ -299,10 +325,12 @@ fn computeScore(entry: MemoryEntry, state: *const DreamState, now: i64) f64 {
     const content_len: f64 = @floatFromInt(@min(entry.content.len, 500));
     const richness = content_len / 500.0;
 
+    _ = now;
+
     return (WEIGHT_RELEVANCE * relevance) +
         (WEIGHT_FREQUENCY * frequency) +
         (WEIGHT_QUERY_DIVERSITY * diversity) +
-        (WEIGHT_RECENCY * recency) +
+        (WEIGHT_TRUST * trust) +
         (WEIGHT_CONSOLIDATION * consolidation) +
         (WEIGHT_RICHNESS * richness);
 }
@@ -408,6 +436,108 @@ test "computeScore returns weighted score" {
     // Score should be reasonably high given good signals
     try std.testing.expect(score > 0.5);
     try std.testing.expect(score <= 1.0);
+}
+
+test "computeScore null relevance still clears MIN_SCORE for well-recalled entry" {
+    // Regression: mem.list() never populates entry.score (sqlite engine returns
+    // .score = null), and computeScore previously defaulted relevance to 0.5,
+    // capping the achievable score below MIN_SCORE=0.8. Result: 28+ dream
+    // cycles with 0 promotions. Falling back to 1.0 lets usage signals decide.
+    var state = DreamState{};
+    defer state.deinit();
+    state._arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const arena = state._arena.?.allocator();
+
+    const key = try arena.dupe(u8, "well_used");
+    try state.recall_counts.put(arena, key, 11);
+
+    var sessions = DreamState.SessionSet{};
+    const s1 = try arena.dupe(u8, "sess_a");
+    const s2 = try arena.dupe(u8, "sess_b");
+    try sessions.put(arena, s1, {});
+    try sessions.put(arena, s2, {});
+    const qkey = try arena.dupe(u8, "well_used");
+    try state.query_diversity.put(arena, qkey, sessions);
+
+    const now = std.time.timestamp();
+    var ts_buf: [20]u8 = undefined;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch unreachable;
+
+    const entry = MemoryEntry{
+        .id = "1",
+        .key = "well_used",
+        .content = "x" ** 500,
+        .category = .daily,
+        .timestamp = ts_str,
+        .score = null,
+    };
+
+    const score = computeScore(entry, &state, now);
+    try std.testing.expect(score >= MIN_SCORE);
+}
+
+test "trust score saturates at TRUST_MAX after enough recalls" {
+    var state = DreamState{};
+    defer state.deinit();
+    state._arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const arena = state._arena.?.allocator();
+
+    const key = try arena.dupe(u8, "popular");
+    try state.trust_scores.put(arena, key, TRUST_DEFAULT);
+
+    // Simulate 20 recall events lifting trust from 0.5 toward 1.0.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const trust = state.trust_scores.getPtr("popular").?;
+        trust.* = @min(TRUST_MAX, trust.* + TRUST_DELTA_HELPFUL);
+    }
+
+    try std.testing.expectApproxEqAbs(TRUST_MAX, state.trust_scores.get("popular").?, 1e-9);
+}
+
+test "computeScore lifts an aged but well-trusted entry over MIN_SCORE" {
+    // Regression: prior 14-day recency half-life caused archive entries to
+    // structurally fail promotion regardless of recall activity. Trust-score
+    // replacement means an aged entry with sustained recall feedback can
+    // climb back into the promotion band.
+    var state = DreamState{};
+    defer state.deinit();
+    state._arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const arena = state._arena.?.allocator();
+
+    const key = try arena.dupe(u8, "ggz_research");
+    try state.recall_counts.put(arena, key, 11);
+
+    var sessions = DreamState.SessionSet{};
+    const s1 = try arena.dupe(u8, "sess_a");
+    const s2 = try arena.dupe(u8, "sess_b");
+    try sessions.put(arena, s1, {});
+    try sessions.put(arena, s2, {});
+    const qkey = try arena.dupe(u8, "ggz_research");
+    try state.query_diversity.put(arena, qkey, sessions);
+
+    // Trust accumulated to TRUST_MAX after many recall events.
+    const tkey = try arena.dupe(u8, "ggz_research");
+    try state.trust_scores.put(arena, tkey, TRUST_MAX);
+
+    // Entry timestamp is 90 days old — old enough that the prior 14-day decay
+    // would have crushed the recency component to ~0.012.
+    const now = std.time.timestamp();
+    const ninety_days_ago = now - 90 * 86400;
+    var ts_buf: [20]u8 = undefined;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{ninety_days_ago}) catch unreachable;
+
+    const entry = MemoryEntry{
+        .id = "1",
+        .key = "ggz_research",
+        .content = "x" ** 500,
+        .category = .daily,
+        .timestamp = ts_str,
+        .score = null,
+    };
+
+    const score = computeScore(entry, &state, now);
+    try std.testing.expect(score >= MIN_SCORE);
 }
 
 test "cronCycleDue fires exactly once per daily window" {
