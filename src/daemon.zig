@@ -361,6 +361,7 @@ fn upsertSchedulerRuntimeJob(
     if (latest.getMutableJob(runtime_job.id)) |dst| {
         dst.next_run_secs = runtime_job.next_run_secs;
         dst.last_run_secs = runtime_job.last_run_secs;
+        dst.last_heartbeat_secs = runtime_job.last_heartbeat_secs;
         dst.last_status = runtime_job.last_status;
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
@@ -403,6 +404,7 @@ fn upsertSchedulerRuntimeJob(
         .command = try allocator.dupe(u8, runtime_job.command),
         .next_run_secs = runtime_job.next_run_secs,
         .last_run_secs = runtime_job.last_run_secs,
+        .last_heartbeat_secs = runtime_job.last_heartbeat_secs,
         .last_status = runtime_job.last_status,
         .paused = runtime_job.paused,
         .one_shot = runtime_job.one_shot,

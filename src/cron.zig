@@ -178,6 +178,11 @@ pub const CronJob = struct {
     command: []const u8,
     next_run_secs: i64 = 0,
     last_run_secs: ?i64 = null,
+    /// Wall-clock timestamp of the most recent heartbeat for an in-flight
+    /// agent job. Set when the job is dispatched and cleared on writeback.
+    /// Used by `reclaimStaleRunning` to detect runs that were orphaned by
+    /// a daemon crash or power loss.
+    last_heartbeat_secs: ?i64 = null,
     last_status: ?[]const u8 = null,
     paused: bool = false,
     one_shot: bool = false,
@@ -534,6 +539,12 @@ fn parseDateOffset(raw: []const u8) ?i64 {
     const mm = std.fmt.parseInt(i64, trimmed[3..5], 10) catch return null;
     return sign * (hh * 3600 + mm * 60);
 }
+
+/// Wall-clock seconds an agent job may stay in `last_status="running"` before
+/// `reclaimStaleRunning` rewrites it to `"stale"`. Sized to comfortably exceed
+/// the longest expected agent run (default agent_timeout_secs is in the order
+/// of minutes) while still catching daemon crashes within the next tick.
+const HEARTBEAT_STALE_SECS: i64 = 30 * 60;
 
 /// In-memory cron job store (no SQLite dependency for the minimal Zig port).
 pub const CronScheduler = struct {
@@ -957,7 +968,32 @@ pub const CronScheduler = struct {
     ///   scheduler.applyDeferredResults(deferred, now, bus);
     ///   allocator.free(deferred);
     ///   unlock();
+    /// Rewrite any agent job stuck in `last_status="running"` whose heartbeat
+    /// is older than `HEARTBEAT_STALE_SECS` to `last_status="stale"`. Returns
+    /// the number of jobs reclaimed. Intended to run at the top of each tick
+    /// so daemon restarts (or worker crashes between dispatch and writeback)
+    /// don't leave the scheduler stuck reporting an in-flight job forever.
+    pub fn reclaimStaleRunning(self: *CronScheduler, now: i64) usize {
+        var reclaimed: usize = 0;
+        for (self.jobs.items) |*job| {
+            if (job.last_status) |status| {
+                if (!std.mem.eql(u8, status, "running")) continue;
+            } else continue;
+
+            const reference = job.last_heartbeat_secs orelse job.last_run_secs orelse continue;
+            if (now - reference < HEARTBEAT_STALE_SECS) continue;
+
+            job.last_status = "stale";
+            job.last_heartbeat_secs = null;
+            reclaimed += 1;
+            log.warn("cron job '{s}' marked stale (no heartbeat for {d}s)", .{ job.id, now - reference });
+        }
+        return reclaimed;
+    }
+
     pub fn tickDeferred(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus, ext_allocator: std.mem.Allocator) []DeferredAgentJob {
+        _ = self.reclaimStaleRunning(now);
+
         var deferred: std.ArrayListUnmanaged(DeferredAgentJob) = .empty;
         var remove_indices: std.ArrayListUnmanaged(usize) = .empty;
         defer remove_indices.deinit(self.allocator);
@@ -1016,8 +1052,11 @@ pub const CronScheduler = struct {
                             }
                         }
                     } else {
-                        // Mark as running but defer actual execution
+                        // Mark as running but defer actual execution. Heartbeat
+                        // is set so reclaimStaleRunning can spot orphaned runs
+                        // if the daemon dies before applyDeferredResults.
                         job.last_run_secs = now;
+                        job.last_heartbeat_secs = now;
                         job.last_status = "running";
                         deferred.append(ext_allocator, .{
                             .job_idx = idx,
@@ -1026,6 +1065,7 @@ pub const CronScheduler = struct {
                         }) catch {
                             log.err("cron agent job '{s}': failed to defer", .{job.id});
                             job.last_status = "error";
+                            job.last_heartbeat_secs = null;
                         };
                     }
                 },
@@ -1066,6 +1106,7 @@ pub const CronScheduler = struct {
 
             if (d.spawn_err) {
                 job.last_status = "error";
+                job.last_heartbeat_secs = null;
                 if (job.last_output) |old| self.allocator.free(old);
                 job.last_output = null;
                 if (out_bus) |b| {
@@ -1077,6 +1118,7 @@ pub const CronScheduler = struct {
 
             if (d.result) |exec_result| {
                 job.last_run_secs = now;
+                job.last_heartbeat_secs = null;
                 job.last_status = if (exec_result.success) "ok" else "error";
                 if (job.last_output) |old| self.allocator.free(old);
                 if (out_bus) |b| {
@@ -1101,6 +1143,8 @@ pub const CronScheduler = struct {
     /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
     /// Separated from `run` for testability.
     pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) bool {
+        _ = self.reclaimStaleRunning(now);
+
         var changed = false;
 
         // Collect indices of one-shot jobs to remove after iteration
@@ -1560,10 +1604,19 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 if (v == .string and v.string.len > 0) {
                     if (std.mem.eql(u8, v.string, "ok")) break :blk "ok";
                     if (std.mem.eql(u8, v.string, "error")) break :blk "error";
+                    if (std.mem.eql(u8, v.string, "running")) break :blk "running";
+                    if (std.mem.eql(u8, v.string, "stale")) break :blk "stale";
                     // Backward-compat aliases from older payloads.
                     if (std.mem.eql(u8, v.string, "success")) break :blk "ok";
                     if (std.mem.eql(u8, v.string, "failed")) break :blk "error";
                 }
+            }
+            break :blk null;
+        };
+        const last_heartbeat_secs: ?i64 = blk: {
+            if (obj.get("last_heartbeat_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+                if (v == .null) break :blk null;
             }
             break :blk null;
         };
@@ -1704,6 +1757,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .command = try scheduler.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
             .last_run_secs = last_run_secs,
+            .last_heartbeat_secs = last_heartbeat_secs,
             .last_status = last_status,
             .paused = paused,
             .one_shot = one_shot,
@@ -2054,6 +2108,15 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         if (job.last_run_secs) |lrs| {
             var int_buf: [24]u8 = undefined;
             const text = std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch unreachable;
+            try buf.appendSlice(scheduler.allocator, text);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "last_heartbeat_secs");
+        if (job.last_heartbeat_secs) |lhb| {
+            var int_buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&int_buf, "{d}", .{lhb}) catch unreachable;
             try buf.appendSlice(scheduler.allocator, text);
         } else {
             try buf.appendSlice(scheduler.allocator, "null");
@@ -3239,6 +3302,81 @@ test "save and load roundtrip" {
     try std.testing.expect(loaded[0].last_status != null);
     try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "reclaimStaleRunning marks orphaned running job as stale" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo orphan");
+    const stale_age = HEARTBEAT_STALE_SECS + 60;
+    const now: i64 = 1_000_000_000;
+    job.last_status = "running";
+    job.last_run_secs = now - stale_age;
+    job.last_heartbeat_secs = now - stale_age;
+
+    const reclaimed = scheduler.reclaimStaleRunning(now);
+    try std.testing.expectEqual(@as(usize, 1), reclaimed);
+    try std.testing.expectEqualStrings("stale", job.last_status.?);
+    try std.testing.expect(job.last_heartbeat_secs == null);
+}
+
+test "reclaimStaleRunning leaves fresh running job alone" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo fresh");
+    const now: i64 = 1_000_000_000;
+    job.last_status = "running";
+    job.last_run_secs = now - 30;
+    job.last_heartbeat_secs = now - 30;
+
+    const reclaimed = scheduler.reclaimStaleRunning(now);
+    try std.testing.expectEqual(@as(usize, 0), reclaimed);
+    try std.testing.expectEqualStrings("running", job.last_status.?);
+    try std.testing.expectEqual(@as(?i64, now - 30), job.last_heartbeat_secs);
+}
+
+test "reclaimStaleRunning ignores non-running jobs even when stale" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo done");
+    const now: i64 = 1_000_000_000;
+    job.last_status = "ok";
+    job.last_run_secs = now - (HEARTBEAT_STALE_SECS * 10);
+
+    const reclaimed = scheduler.reclaimStaleRunning(now);
+    try std.testing.expectEqual(@as(usize, 0), reclaimed);
+    try std.testing.expectEqualStrings("ok", job.last_status.?);
+}
+
+test "save and load roundtrip preserves heartbeat and running status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cfg_dir);
+    setTestConfigDir(cfg_dir);
+    defer setTestConfigDir(null);
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo running");
+    job.last_status = "running";
+    job.last_run_secs = 1_700_000_000;
+    job.last_heartbeat_secs = 1_700_000_120;
+
+    try saveJobs(&scheduler);
+
+    var scheduler2 = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler2.deinit();
+    try loadJobs(&scheduler2);
+
+    const loaded = scheduler2.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("running", loaded[0].last_status.?);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_120), loaded[0].last_heartbeat_secs);
 }
 
 test "acquireCronStoreLock creates sidecar file and releases cleanly" {
