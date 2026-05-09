@@ -224,6 +224,13 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
     var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
 
+    // Lifecycle (hygiene + dreaming) re-evaluation cadence. The underlying
+    // runIfDue functions gate on their own cron/interval expressions, so
+    // polling every 60s just ensures the configured schedule actually fires
+    // without requiring a daemon restart.
+    const lifecycle_tick_interval_ns: i128 = 60 * std.time.ns_per_s;
+    var next_lifecycle_tick_at_ns: i128 = std.time.nanoTimestamp() + lifecycle_tick_interval_ns;
+
     while (!isShutdownRequested()) {
         writeStateFile(allocator, state_path, state) catch {};
         health.markComponentOk("heartbeat");
@@ -267,6 +274,13 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }
             next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+        }
+
+        if (now_ns >= next_lifecycle_tick_at_ns) {
+            if (heartbeat_mem_rt) |*rt| {
+                rt.tickLifecycleIfDue(allocator, &config.memory, config.workspace_dir);
+            }
+            next_lifecycle_tick_at_ns = now_ns + lifecycle_tick_interval_ns;
         }
 
         std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
@@ -423,6 +437,9 @@ fn mergeSchedulerTickChangesAndSave(
     runtime: *const CronScheduler,
     before_tick: *const std.StringHashMapUnmanaged(SchedulerJobSnapshot),
 ) !void {
+    var lock = try cron.acquireCronStoreLock(allocator);
+    defer lock.release();
+
     var latest = CronScheduler.init(allocator, runtime.max_tasks, runtime.enabled);
     defer latest.deinit();
     try cron.loadJobsStrict(&latest);

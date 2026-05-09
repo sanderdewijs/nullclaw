@@ -60,6 +60,11 @@ pub const CronAddTool = struct {
             }
         }
 
+        var lock = cron.acquireCronStoreLock(allocator) catch {
+            return ToolResult.fail("Failed to acquire cron store lock");
+        };
+        defer lock.release();
+
         var scheduler = loadScheduler(allocator) catch {
             return ToolResult.fail("Failed to load scheduler state");
         };

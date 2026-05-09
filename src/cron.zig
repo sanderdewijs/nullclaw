@@ -1991,6 +1991,43 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
     };
 }
 
+/// Path to the advisory-lock sidecar that serializes cron.json mutations.
+fn cronStoreLockPath(allocator: std.mem.Allocator) ![]const u8 {
+    const dir = try resolveConfigDir(allocator);
+    defer allocator.free(dir);
+    return config_paths.pathFromConfigDir(allocator, dir, "cron.json.lock");
+}
+
+/// Guard returned by `acquireCronStoreLock`. Holders must call `release()`.
+pub const CronStoreLock = struct {
+    file: std.fs.File,
+
+    pub fn release(self: *CronStoreLock) void {
+        self.file.unlock();
+        self.file.close();
+    }
+};
+
+/// Take an exclusive advisory lock that serializes load+modify+save sequences
+/// against the cron store. Daemon scheduler ticks, CLI mutation tools, and
+/// gateway-driven edits all funnel through this lock so concurrent writers
+/// cannot lose each other's updates. Blocks until acquired.
+pub fn acquireCronStoreLock(allocator: std.mem.Allocator) !CronStoreLock {
+    try ensureCronDir(allocator);
+    const lock_path = try cronStoreLockPath(allocator);
+    defer allocator.free(lock_path);
+
+    const file = try std.fs.createFileAbsolute(lock_path, .{
+        .read = true,
+        .truncate = false,
+    });
+    errdefer file.close();
+
+    try file.lock(.exclusive);
+
+    return .{ .file = file };
+}
+
 /// Save scheduler jobs to cron.json in the config directory.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     try ensureCronDir(scheduler.allocator);
