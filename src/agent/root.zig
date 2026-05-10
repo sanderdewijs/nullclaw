@@ -41,6 +41,7 @@ pub const skill_router = @import("skill_router.zig");
 pub const retry = @import("retry.zig");
 pub const session_digest = @import("session_digest.zig");
 pub const task_contract = @import("task_contract.zig");
+pub const memory_corrector = @import("memory_corrector.zig");
 const skillforge_evolution = @import("../skillforge_evolution.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
@@ -398,6 +399,9 @@ pub const Agent = struct {
     /// Skill affinity history for routing stickiness (ring buffer of recent skill names).
     skill_affinity_history: ?skill_router.AffinityHistory = null,
 
+    /// Keys recalled by memory_loader during the current turn (for self-correction).
+    recalled_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+
     /// Skill evolution performance tracker (detects improvement opportunities).
     /// Heap-allocated because the tracker is ~11 KB (32 skill slots × ring buffers).
     evolution_tracker: ?*skillforge_evolution.SkillPerformanceTracker = null,
@@ -611,6 +615,8 @@ pub const Agent = struct {
         self.tool_state_mu.unlock();
         if (self.prev_turn_skill_owned) |s| self.allocator.free(s);
         if (self.skill_affinity_history) |*ah| ah.deinit();
+        for (self.recalled_keys.items) |k| self.allocator.free(k);
+        self.recalled_keys.deinit(self.allocator);
         if (self.evolution_tracker) |tracker| self.allocator.destroy(tracker);
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
@@ -1691,6 +1697,17 @@ pub const Agent = struct {
         if (self.prev_turn_context) |prev_ctx| {
             const feedback = turn_scorer.detectFeedback(user_message);
             const score = turn_scorer.scoreTurn(prev_ctx, feedback);
+            // Diagnostic: surface score distribution so EvolutionConfig thresholds
+            // (currently -0.5 / -0.2) can be tuned against real data. No unit test
+            // — pure log line, covered by integration observation in gateway.log.
+            log.info("turn_scored skill={s} model={s} score={d:.3} tool_failures={d} tf_signal={} neg_signal={}", .{
+                prev_ctx.skill,
+                prev_ctx.model,
+                score.score,
+                score.tool_failures,
+                score.signals.tool_failure,
+                score.signals.explicit_negative,
+            });
             const scored_event = ObserverEvent{ .turn_scored = .{
                 .score = score.score,
                 .tool_count = score.tool_count,
@@ -1705,8 +1722,10 @@ pub const Agent = struct {
             // ── Skill evolution: check for improvement triggers ──
             if (self.evolution_tracker) |tracker| {
                 const now_ts = std.time.timestamp();
+                // recordScore expects skill_name; prev_ctx.model was passed by mistake,
+                // which keyed all scores by model and broke per-skill aggregation.
                 if (tracker.recordScore(
-                    prev_ctx.model,
+                    prev_ctx.skill,
                     score.score,
                     score.tool_failures,
                     score.signals.tool_failure,
@@ -1912,8 +1931,11 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
+        // Recalled keys are tracked for memory self-correction after the turn.
+        for (self.recalled_keys.items) |k| self.allocator.free(k);
+        self.recalled_keys.clearRetainingCapacity();
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
+            try memory_loader.enrichMessageWithRuntimeAndKeys(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id, self.workspace_dir, &self.recalled_keys)
         else
             try self.allocator.dupe(u8, effective_user_message);
 
@@ -2426,6 +2448,16 @@ pub const Agent = struct {
 
                 // ── Turn scorer: save context for deferred feedback scoring ──
                 self.savePrevTurnContext(turn_ctx);
+
+                // ── Memory self-correction: forget recalled entries that contradict tool success ──
+                if (turn_ctx.tools_called > 0) {
+                    _ = memory_corrector.correctContradictions(
+                        self.allocator,
+                        self.mem,
+                        self.recalled_keys.items,
+                        turn_ctx.tools_failed == 0,
+                    );
+                }
 
                 // ── Task contract: verify checkpoints and persist result ──
                 if (self.current_contract) |*contract| {
@@ -3696,6 +3728,7 @@ test {
     _ = cli;
     _ = prompt;
     _ = memory_loader;
+    _ = memory_corrector;
 }
 
 // ── Additional agent tests ──────────────────────────────────────

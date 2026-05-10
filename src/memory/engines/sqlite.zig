@@ -573,6 +573,75 @@ pub const SqliteMemory = struct {
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    /// Store with an explicit created_at timestamp (epoch seconds).
+    /// Used by hygiene archival to preserve original entry timestamps.
+    /// created_at reflects when the content was originally created (for recall scoring).
+    /// updated_at is always set to now (for hygiene lifecycle — prevents immediate re-pruning).
+    fn implStoreAt(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8, created_at: i64) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const ts = std.fmt.allocPrint(self_.allocator, "{d}", .{created_at}) catch return error.StepFailed;
+        defer self_.allocator.free(ts);
+
+        const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
+        defer self_.allocator.free(now);
+
+        const id = generateId(self_.allocator) catch return error.StepFailed;
+        defer self_.allocator.free(id);
+
+        const cat_str = category.toString();
+
+        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
+            "ON CONFLICT(key, COALESCE(session_id, '__global__')) DO UPDATE SET " ++
+            "content = excluded.content, " ++
+            "category = excluded.category, " ++
+            "updated_at = excluded.updated_at";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 4, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 5, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 5);
+        }
+        _ = c.sqlite3_bind_text(stmt, 6, ts.ptr, @intCast(ts.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 7, now.ptr, @intCast(now.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    /// Purge entries by category where updated_at is older than cutoff_epoch.
+    fn implPurgeCategory(ptr: *anyopaque, category: MemoryCategory, cutoff_epoch: i64) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const cat_str = category.toString();
+
+        const cutoff_str = std.fmt.allocPrint(self_.allocator, "{d}", .{cutoff_epoch}) catch return error.StepFailed;
+        defer self_.allocator.free(cutoff_str);
+
+        const sql = "DELETE FROM memories WHERE category = ?1 AND CAST(updated_at AS INTEGER) < ?2";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, cutoff_str.ptr, @intCast(cutoff_str.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        return @intCast(c.sqlite3_changes(self_.db));
+    }
+
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -789,6 +858,8 @@ pub const SqliteMemory = struct {
     pub const vtable = Memory.VTable{
         .name = &implName,
         .store = &implStore,
+        .storeAt = &implStoreAt,
+        .purgeCategory = &implPurgeCategory,
         .recall = &implRecall,
         .get = &implGet,
         .getScoped = &implGetScoped,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const multimodal = @import("../multimodal.zig");
+const dream_state = memory_mod.dream_state;
 const Memory = memory_mod.Memory;
 const MemoryEntry = memory_mod.MemoryEntry;
 const MemoryRuntime = memory_mod.MemoryRuntime;
@@ -49,6 +50,35 @@ fn extractMarkdownMemoryKey(content: []const u8) ?[]const u8 {
     return memory_mod.extractMarkdownMemoryKey(content);
 }
 
+/// Best-effort recall tracking for the dreaming engine.
+fn trackRecallEntries(allocator: std.mem.Allocator, workspace_dir: []const u8, entries: []const MemoryEntry, session_id: ?[]const u8) void {
+    if (workspace_dir.len == 0) return;
+    const sid = session_id orelse "global";
+    const now = std.time.timestamp();
+    for (entries) |entry| {
+        if (memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+        dream_state.appendRecallEvent(allocator, workspace_dir, .{
+            .key = entry.key,
+            .session_id = sid,
+            .timestamp = now,
+        });
+    }
+}
+
+fn trackRecallCandidates(allocator: std.mem.Allocator, workspace_dir: []const u8, candidates: []const memory_mod.RetrievalCandidate, session_id: ?[]const u8) void {
+    if (workspace_dir.len == 0) return;
+    const sid = session_id orelse "global";
+    const now = std.time.timestamp();
+    for (candidates) |cand| {
+        if (memory_mod.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+        dream_state.appendRecallEvent(allocator, workspace_dir, .{
+            .key = cand.key,
+            .session_id = sid,
+            .timestamp = now,
+        });
+    }
+}
+
 fn isInternalMemoryEntry(entry: MemoryEntry) bool {
     return memory_mod.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
 }
@@ -76,11 +106,25 @@ pub fn loadContext(
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
+    workspace_dir: []const u8,
+) ![]const u8 {
+    return loadContextAndKeys(allocator, mem, user_message, session_id, workspace_dir, null);
+}
+
+fn loadContextAndKeys(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+    workspace_dir: []const u8,
+    recalled_keys_out: ?*std.ArrayListUnmanaged([]const u8),
 ) ![]const u8 {
     const scoped_entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.freeEntries(allocator, scoped_entries);
+
+    trackRecallEntries(allocator, workspace_dir, scoped_entries, session_id);
 
     // When scoped recall is enabled, also include global (session_id = null) memory
     // so long-term facts from memory_store remain visible in session chats.
@@ -109,6 +153,9 @@ pub fn loadContext(
         const sanitized = try sanitizeMemoryText(allocator, content);
         defer allocator.free(sanitized);
         try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+        if (recalled_keys_out) |keys| {
+            keys.append(allocator, try allocator.dupe(u8, entry.key)) catch {};
+        }
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -129,6 +176,9 @@ pub fn loadContext(
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                if (recalled_keys_out) |keys| {
+                    keys.append(allocator, try allocator.dupe(u8, entry.key)) catch {};
+                }
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
@@ -150,11 +200,25 @@ pub fn loadContextWithRuntime(
     rt: *MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    workspace_dir: []const u8,
+) ![]const u8 {
+    return loadContextWithRuntimeAndKeys(allocator, rt, user_message, session_id, workspace_dir, null);
+}
+
+fn loadContextWithRuntimeAndKeys(
+    allocator: std.mem.Allocator,
+    rt: *MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+    workspace_dir: []const u8,
+    recalled_keys_out: ?*std.ArrayListUnmanaged([]const u8),
 ) ![]const u8 {
     const scoped_candidates = rt.search(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.retrieval.freeCandidates(allocator, scoped_candidates);
+
+    trackRecallCandidates(allocator, workspace_dir, scoped_candidates, session_id);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -175,6 +239,9 @@ pub fn loadContextWithRuntime(
         const sanitized = try sanitizeMemoryText(allocator, snippet);
         defer allocator.free(sanitized);
         try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, sanitized });
+        if (recalled_keys_out) |keys| {
+            keys.append(allocator, try allocator.dupe(u8, cand.key)) catch {};
+        }
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -197,6 +264,9 @@ pub fn loadContextWithRuntime(
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
                 try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                if (recalled_keys_out) |keys| {
+                    keys.append(allocator, try allocator.dupe(u8, entry.key)) catch {};
+                }
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
@@ -216,8 +286,9 @@ pub fn enrichMessage(
     mem: Memory,
     user_message: []const u8,
     session_id: ?[]const u8,
+    workspace_dir: []const u8,
 ) ![]const u8 {
-    const context = try loadContext(allocator, mem, user_message, session_id);
+    const context = try loadContext(allocator, mem, user_message, session_id, workspace_dir);
     if (context.len == 0) {
         allocator.free(context);
         return try allocator.dupe(u8, user_message);
@@ -234,11 +305,25 @@ pub fn enrichMessageWithRuntime(
     mem_rt: ?*MemoryRuntime,
     user_message: []const u8,
     session_id: ?[]const u8,
+    workspace_dir: []const u8,
+) ![]const u8 {
+    return enrichMessageWithRuntimeAndKeys(allocator, mem, mem_rt, user_message, session_id, workspace_dir, null);
+}
+
+/// Enrich a user message, optionally collecting recalled memory keys for self-correction.
+pub fn enrichMessageWithRuntimeAndKeys(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    mem_rt: ?*MemoryRuntime,
+    user_message: []const u8,
+    session_id: ?[]const u8,
+    workspace_dir: []const u8,
+    recalled_keys_out: ?*std.ArrayListUnmanaged([]const u8),
 ) ![]const u8 {
     const context = if (mem_rt) |rt|
-        try loadContextWithRuntime(allocator, rt, user_message, session_id)
+        try loadContextWithRuntimeAndKeys(allocator, rt, user_message, session_id, workspace_dir, recalled_keys_out)
     else
-        try loadContext(allocator, mem, user_message, session_id);
+        try loadContextAndKeys(allocator, mem, user_message, session_id, workspace_dir, recalled_keys_out);
 
     if (context.len == 0) {
         allocator.free(context);
@@ -258,7 +343,7 @@ test "loadContext returns empty for no-op memory" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const context = try loadContext(allocator, mem, "hello", null);
+    const context = try loadContext(allocator, mem, "hello", null, "");
     defer allocator.free(context);
 
     try std.testing.expectEqualStrings("", context);
@@ -269,7 +354,7 @@ test "enrichMessage with no context returns original" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessage(allocator, mem, "hello", null);
+    const enriched = try enrichMessage(allocator, mem, "hello", null, "");
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("hello", enriched);
@@ -286,7 +371,7 @@ test "loadContext with session_id includes global entries but not other sessions
     try mem.store("global_fact", "global favorite", .core, null);
     try mem.store("sess_b_fact", "session B favorite", .core, "sess-b");
 
-    const context = try loadContext(allocator, mem, "favorite", "sess-a");
+    const context = try loadContext(allocator, mem, "favorite", "sess-a", "");
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);
@@ -331,7 +416,7 @@ test "enrichMessageWithRuntime with no memories returns original message" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null);
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "hello world", null, "");
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("hello world", enriched);
@@ -346,7 +431,7 @@ test "enrichMessageWithRuntime with memories prepends context" {
 
     try mem.store("user_lang", "Zig is the favorite language", .core, null);
 
-    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null);
+    const enriched = try enrichMessageWithRuntime(allocator, mem, null, "language", null, "");
     defer allocator.free(enriched);
 
     // Should contain [Memory context] header and the stored entry
@@ -369,7 +454,7 @@ test "loadContext filters internal autosave and hygiene entries" {
     try mem.store("last_hygiene_at", "1772051598", .core, null);
     try mem.store("user_language", "Отвечай на русском языке", .core, null);
 
-    const context = try loadContext(allocator, mem, "русском", null);
+    const context = try loadContext(allocator, mem, "русском", null, "");
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "user_language") != null);
@@ -389,7 +474,7 @@ test "loadContext filters markdown-encoded internal entries" {
     try mem.store("MEMORY:3", "**last_hygiene_at**: 1772051598", .core, null);
     try mem.store("MEMORY:4", "**Name**: User", .core, null);
 
-    const context = try loadContext(allocator, mem, "User", null);
+    const context = try loadContext(allocator, mem, "User", null, "");
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "last_hygiene_at") == null);
@@ -406,7 +491,7 @@ test "loadContext filters bootstrap prompt internal keys" {
     try mem.store("__bootstrap.prompt.SOUL.md", "persona-internal", .core, null);
     try mem.store("user_goal", "ship reliable builds", .core, null);
 
-    const context = try loadContext(allocator, mem, "ship", null);
+    const context = try loadContext(allocator, mem, "ship", null, "");
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "user_goal") != null);
@@ -457,7 +542,7 @@ test "loadContextWithRuntime returns empty when only internal entries match" {
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "привет", null);
+    const context = try loadContextWithRuntime(allocator, &rt, "привет", null, "");
     defer allocator.free(context);
     try std.testing.expectEqualStrings("", context);
 }
@@ -505,7 +590,7 @@ test "loadContextWithRuntime with session_id includes global entries but not oth
         ._allocator = allocator,
     };
 
-    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a");
+    const context = try loadContextWithRuntime(allocator, &rt, "favorite", "sess-a", "");
     defer allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "sess_a_fact") != null);

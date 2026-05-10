@@ -379,6 +379,10 @@ pub fn prepareMessagesForProvider(
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
+                // Preserve the local file path as a text note so the agent can
+                // reference it in tool calls (e.g. receipt upload scripts).
+                const path_note = try std.fmt.allocPrint(arena, "[Attached image file: {s}]", .{ref});
+                try parts.append(arena, .{ .text = path_note });
                 try parts.append(arena, .{ .image_base64 = .{
                     .data = b64,
                     .media_type = img.mime_type,

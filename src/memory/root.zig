@@ -453,6 +453,15 @@ pub const Memory = struct {
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// Optional: store with an explicit created_at timestamp (epoch seconds).
+        /// Used by hygiene archival to preserve the original entry's timestamp
+        /// instead of using the current time.
+        storeAt: ?*const fn (ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8, created_at: i64) anyerror!void = null,
+        /// Optional: purge all entries in a category where updated_at < cutoff_epoch.
+        /// Used by hygiene to clean up archive DB entries based on when they entered
+        /// the database (not when the original content was created).
+        /// Returns the number of entries deleted.
+        purgeCategory: ?*const fn (ptr: *anyopaque, category: MemoryCategory, cutoff_epoch: i64) anyerror!u64 = null,
         /// Optional: update L0 abstract and/or L1 overview for a stored memory.
         updateTiers: ?*const fn (ptr: *anyopaque, key: []const u8, abstract_text: ?[]const u8, overview_text: ?[]const u8) anyerror!void = null,
     };
@@ -463,6 +472,24 @@ pub const Memory = struct {
 
     pub fn store(self: Memory, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) !void {
         return self.vtable.store(self.ptr, key, content, category, session_id);
+    }
+
+    /// Store with an explicit created_at timestamp (epoch seconds).
+    /// Falls back to regular store() if the engine does not support it.
+    pub fn storeAt(self: Memory, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8, created_at: i64) !void {
+        if (self.vtable.storeAt) |func| {
+            return func(self.ptr, key, content, category, session_id, created_at);
+        }
+        return self.vtable.store(self.ptr, key, content, category, session_id);
+    }
+
+    /// Purge entries in a category where updated_at is older than cutoff_epoch.
+    /// Returns the number of entries deleted, or null if the engine does not support it.
+    pub fn purgeCategory(self: Memory, category: MemoryCategory, cutoff_epoch: i64) !?u64 {
+        if (self.vtable.purgeCategory) |func| {
+            return try func(self.ptr, category, cutoff_epoch);
+        }
+        return null;
     }
 
     pub fn recall(self: Memory, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
@@ -650,6 +677,30 @@ pub const MemoryRuntime = struct {
     /// Get current rollout mode.
     pub fn rolloutMode(self: *const MemoryRuntime) rollout.RolloutMode {
         return self._rollout_policy.mode;
+    }
+
+    /// Re-evaluate hygiene + dreaming lifecycle schedules. Cheap when no
+    /// window has elapsed (each runIfDue bails via its own cron/interval
+    /// gate). Intended to be called from a long-lived polling thread — e.g.,
+    /// the daemon heartbeat loop — so lifecycle phases actually fire on
+    /// their configured schedule instead of only at process startup.
+    pub fn tickLifecycleIfDue(
+        self: *MemoryRuntime,
+        allocator: std.mem.Allocator,
+        memory_cfg: *const config_types.MemoryConfig,
+        workspace_dir: []const u8,
+    ) void {
+        runLifecycleIfDue(
+            allocator,
+            self.memory,
+            workspace_dir,
+            &memory_cfg.lifecycle,
+            &memory_cfg.dreaming,
+            self._outbox,
+            self._embedding_provider,
+            self._vector_store,
+            self._circuit_breaker,
+        );
     }
 
     /// Best-effort vector sync after a store() call.
@@ -872,6 +923,78 @@ fn deleteLegacyVectorKey(vs: vector_store.VectorStore, encoded_key: []const u8, 
     vs.delete(decoded.logical_key) catch |err| {
         log.warn("{s} failed for legacy key '{s}': {}", .{ log_prefix, decoded.logical_key, err });
     };
+}
+
+/// Run hygiene + dreaming lifecycle phases, each gated by its own due-check.
+/// Called both at startup (from initRuntime, with freshly-built components)
+/// and on every daemon heartbeat tick (via MemoryRuntime.tickLifecycleIfDue,
+/// with components retained on the runtime). Cheap on the common path where
+/// neither gate fires — each runIfDue returns fast when the window hasn't
+/// elapsed.
+fn runLifecycleIfDue(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    workspace_dir: []const u8,
+    lifecycle_cfg: *const config_types.MemoryLifecycleConfig,
+    dreaming_cfg: *const config_types.MemoryDreamingConfig,
+    outbox_inst: ?*outbox.VectorOutbox,
+    embed_provider: ?embeddings.EmbeddingProvider,
+    vs_iface: ?vector_store.VectorStore,
+    cb_inst: ?*circuit_breaker.CircuitBreaker,
+) void {
+    // Hygiene
+    if (lifecycle_cfg.hygiene_enabled) {
+        var preserve_sync_ctx = HygienePreserveSyncCtx{
+            .outbox = outbox_inst,
+            .embed_provider = embed_provider,
+            .vector_store = vs_iface,
+            .circuit_breaker = cb_inst,
+        };
+        const preserve_sync_hook: ?hygiene.PreserveSyncHook = if (lifecycle_cfg.preserve_before_purge and
+            (outbox_inst != null or (embed_provider != null and vs_iface != null)))
+            .{
+                .ptr = @ptrCast(&preserve_sync_ctx),
+                .callback = syncPreservedChunkToVector,
+            }
+        else
+            null;
+        const hygiene_cfg = hygiene.HygieneConfig{
+            .hygiene_enabled = true,
+            .archive_after_days = lifecycle_cfg.archive_after_days,
+            .purge_after_days = lifecycle_cfg.purge_after_days,
+            .preserve_before_purge = lifecycle_cfg.preserve_before_purge,
+            .conversation_retention_days = lifecycle_cfg.conversation_retention_days,
+            .workspace_dir = workspace_dir,
+        };
+        const report = hygiene.runIfDue(allocator, hygiene_cfg, mem, preserve_sync_hook);
+
+        if (lifecycle_cfg.snapshot_on_hygiene and report.totalActions() > 0) {
+            _ = snapshot.exportSnapshot(allocator, mem, workspace_dir) catch |e| {
+                log.warn("snapshot export after hygiene failed: {}", .{e});
+            };
+        }
+    }
+
+    // Dreaming
+    if (dreaming_cfg.enabled) {
+        const dream_cfg = dreaming.DreamingConfig{
+            .enabled = true,
+            .frequency = dreaming_cfg.frequency,
+            .timezone = dreaming_cfg.timezone,
+            .workspace_dir = workspace_dir,
+        };
+        const dream_report = dreaming.runIfDue(allocator, dream_cfg, mem);
+        if (!dream_report.skipped) {
+            log.info("dreaming: cycle completed, light={d} deep={d}/{d} rem={s}", .{
+                dream_report.light_recall_events_processed,
+                dream_report.deep_entries_promoted,
+                dream_report.deep_entries_scored,
+                if (dream_report.rem_prompt != null) "yes" else "no",
+            });
+            var report_mut = dream_report;
+            report_mut.deinit(allocator);
+        }
+    }
 }
 
 fn syncPreservedChunkToVector(
@@ -1219,60 +1342,19 @@ pub fn initRuntime(
         }
     }
 
-    // ── Lifecycle: hygiene ──
-    if (config.lifecycle.hygiene_enabled) {
-        var preserve_sync_ctx = HygienePreserveSyncCtx{
-            .outbox = outbox_inst,
-            .embed_provider = embed_provider,
-            .vector_store = vs_iface,
-            .circuit_breaker = cb_inst,
-        };
-        const preserve_sync_hook: ?hygiene.PreserveSyncHook = if (config.lifecycle.preserve_before_purge and
-            (outbox_inst != null or (embed_provider != null and vs_iface != null)))
-            .{
-                .ptr = @ptrCast(&preserve_sync_ctx),
-                .callback = syncPreservedChunkToVector,
-            }
-        else
-            null;
-        const hygiene_cfg = hygiene.HygieneConfig{
-            .hygiene_enabled = true,
-            .archive_after_days = config.lifecycle.archive_after_days,
-            .purge_after_days = config.lifecycle.purge_after_days,
-            .preserve_before_purge = config.lifecycle.preserve_before_purge,
-            .conversation_retention_days = config.lifecycle.conversation_retention_days,
-            .workspace_dir = workspace_dir,
-        };
-        const report = hygiene.runIfDue(allocator, hygiene_cfg, instance.memory, preserve_sync_hook);
-
-        // Snapshot after hygiene if configured and hygiene did work
-        if (config.lifecycle.snapshot_on_hygiene and report.totalActions() > 0) {
-            _ = snapshot.exportSnapshot(allocator, instance.memory, workspace_dir) catch |e| {
-                log.warn("snapshot export after hygiene failed: {}", .{e});
-            };
-        }
-    }
-
-    // ── Lifecycle: dreaming ──
-    if (config.dreaming.enabled) {
-        const dream_cfg = dreaming.DreamingConfig{
-            .enabled = true,
-            .frequency = config.dreaming.frequency,
-            .timezone = config.dreaming.timezone,
-            .workspace_dir = workspace_dir,
-        };
-        const dream_report = dreaming.runIfDue(allocator, dream_cfg, instance.memory);
-        if (!dream_report.skipped) {
-            log.info("dreaming: cycle completed, light={d} deep={d}/{d} rem={s}", .{
-                dream_report.light_recall_events_processed,
-                dream_report.deep_entries_promoted,
-                dream_report.deep_entries_scored,
-                if (dream_report.rem_prompt != null) "yes" else "no",
-            });
-            var report_mut = dream_report;
-            report_mut.deinit(allocator);
-        }
-    }
+    // ── Lifecycle: hygiene + dreaming ──
+    // Gated internally by cron/interval checks; safe to call repeatedly.
+    runLifecycleIfDue(
+        allocator,
+        instance.memory,
+        workspace_dir,
+        &config.lifecycle,
+        &config.dreaming,
+        outbox_inst,
+        embed_provider,
+        vs_iface,
+        cb_inst,
+    );
 
     // Enforce fallback_policy: if fail_fast and vector plane was expected but failed, abort.
     if (std.mem.eql(u8, config.reliability.fallback_policy, "fail_fast")) {

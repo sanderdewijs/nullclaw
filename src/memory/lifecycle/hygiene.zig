@@ -29,9 +29,10 @@ pub const HygieneReport = struct {
     archived_memory_files: u64 = 0,
     purged_memory_archives: u64 = 0,
     pruned_conversation_rows: u64 = 0,
+    pruned_archive_rows: u64 = 0,
 
     pub fn totalActions(self: *const HygieneReport) u64 {
-        return self.archived_memory_files + self.purged_memory_archives + self.pruned_conversation_rows;
+        return self.archived_memory_files + self.purged_memory_archives + self.pruned_conversation_rows + self.pruned_archive_rows;
     }
 };
 
@@ -80,6 +81,16 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
                 config.preserve_before_purge,
                 preserve_sync_hook,
             ) catch 0;
+        }
+    }
+
+    // Prune old archive rows in the database.
+    // Archive entries are the final preservation tier — they are NOT
+    // re-preserved before deletion. Without this step, preserved chunks
+    // accumulate forever because purgeOldArchives only removes files.
+    if (config.purge_after_days > 0) {
+        if (mem) |m| {
+            report.pruned_archive_rows = pruneArchiveRows(allocator, m, config.purge_after_days) catch 0;
         }
     }
 
@@ -197,7 +208,7 @@ fn purgeOldArchives(
         if (mtime_secs >= cutoff_secs) continue;
 
         if (config.preserve_before_purge and mem != null and std.mem.endsWith(u8, entry.name, ".md")) {
-            preserveArchiveFile(allocator, archive_dir, entry.name, mem.?, preserve_sync_hook) catch |err| {
+            preserveArchiveFile(allocator, archive_dir, entry.name, mem.?, mtime_secs, preserve_sync_hook) catch |err| {
                 log.warn("skipping purge for '{s}' because preservation failed: {}", .{ entry.name, err });
                 continue;
             };
@@ -215,6 +226,7 @@ fn preserveArchiveFile(
     archive_dir: std.fs.Dir,
     file_name: []const u8,
     mem: Memory,
+    original_timestamp: i64,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
     const content = try fs_compat.readFileAlloc(archive_dir, allocator, file_name, ARCHIVE_READ_MAX_BYTES);
@@ -234,7 +246,7 @@ fn preserveArchiveFile(
             .{ file_name, idx + 1, chunks.len, chunk.content },
         );
         defer allocator.free(wrapped);
-        try mem.store(key, wrapped, ARCHIVE_CATEGORY, null);
+        try mem.storeAt(key, wrapped, ARCHIVE_CATEGORY, null, original_timestamp);
         if (preserve_sync_hook) |hook| {
             hook.callback(hook.ptr, allocator, key, wrapped);
         }
@@ -246,6 +258,7 @@ fn preserveConversationEntry(
     mem: Memory,
     key_prefix: []const u8,
     content: []const u8,
+    original_timestamp: i64,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
     const chunks = try chunker.chunkMarkdown(allocator, content, ARCHIVE_CHUNK_MAX_TOKENS);
@@ -261,7 +274,7 @@ fn preserveConversationEntry(
             .{ key_prefix, idx + 1, chunks.len, chunk.content },
         );
         defer allocator.free(wrapped);
-        try mem.store(archive_key, wrapped, ARCHIVE_CATEGORY, null);
+        try mem.storeAt(archive_key, wrapped, ARCHIVE_CATEGORY, null, original_timestamp);
         if (preserve_sync_hook) |hook| {
             hook.callback(hook.ptr, allocator, archive_key, wrapped);
         }
@@ -300,7 +313,7 @@ fn pruneConversationRowsWithPreserve(
             if (preserve_before_forget) {
                 const preserve_key_prefix = try std.fmt.allocPrint(allocator, "archive:conversation:{s}", .{entry.key});
                 defer allocator.free(preserve_key_prefix);
-                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, preserve_sync_hook) catch |err| {
+                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, ts, preserve_sync_hook) catch |err| {
                     log.warn("skipping prune for '{s}' because preservation failed: {}", .{ entry.key, err });
                     continue;
                 };
@@ -344,6 +357,16 @@ fn normalizeTimestampToSeconds(raw: u128) ?i64 {
     return @intCast(ts_secs);
 }
 
+/// Prune archive-category rows from the database that are older than retention_days.
+/// Archive entries are the final preservation tier and are deleted without further backup.
+/// Uses updated_at (via purgeCategory) so that freshly preserved entries survive for the
+/// full retention period, even if their original content (created_at) is much older.
+fn pruneArchiveRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
+    _ = allocator;
+    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
+    return mem.purgeCategory(ARCHIVE_CATEGORY, cutoff_secs) catch 0 orelse 0;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 test "HygieneReport totalActions" {
@@ -351,8 +374,9 @@ test "HygieneReport totalActions" {
         .archived_memory_files = 3,
         .purged_memory_archives = 2,
         .pruned_conversation_rows = 5,
+        .pruned_archive_rows = 1,
     };
-    try std.testing.expectEqual(@as(u64, 10), report.totalActions());
+    try std.testing.expectEqual(@as(u64, 11), report.totalActions());
 }
 
 test "HygieneReport zero actions" {
