@@ -153,6 +153,9 @@ pub const AutonomyConfig = struct {
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
+    /// Additional directories (absolute paths) bound read-write into the sandbox.
+    /// Applied after allowed_paths and workspace_dir so child paths win over parent ro-binds.
+    writable_paths: []const []const u8 = &.{},
 };
 
 pub const DockerRuntimeConfig = struct {

@@ -438,6 +438,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .fallback_api_key = resolved_api_key,
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
+        .writable_paths = cfg.autonomy.writable_paths,
         .policy = &policy,
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,

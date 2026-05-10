@@ -1215,6 +1215,7 @@ pub const SessionManager = struct {
             .fallback_api_key = self.config.defaultProviderKey(),
             .tools_config = self.config.tools,
             .allowed_paths = self.config.autonomy.allowed_paths,
+            .writable_paths = self.config.autonomy.writable_paths,
             .policy = self.policy,
             .subagent_manager = self.subagent_manager,
             .bootstrap_provider = bootstrap_provider,

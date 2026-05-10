@@ -328,6 +328,7 @@ pub fn allTools(
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         allowed_paths: []const []const u8 = &.{},
+        writable_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
@@ -365,6 +366,8 @@ pub fn allTools(
             mapConfigSandboxBackend(opts.sandbox_backend),
             workspace_dir,
             &st.sandbox_storage,
+            opts.allowed_paths,
+            opts.writable_paths,
         );
     }
     try list.append(allocator, st.tool());

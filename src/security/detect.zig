@@ -29,6 +29,10 @@ pub fn createSandbox(
     /// Caller-provided storage for sandbox backend structs.
     /// Must remain valid for the lifetime of the returned Sandbox.
     storage: *SandboxStorage,
+    /// Extra paths to bind read-only into bubblewrap sandbox.
+    allowed_paths: []const []const u8,
+    /// Extra paths to bind read-write into bubblewrap sandbox.
+    writable_paths: []const []const u8,
 ) Sandbox {
     switch (backend) {
         .none => {
@@ -52,7 +56,11 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .bubblewrap => {
-            storage.bubblewrap = .{ .workspace_dir = workspace_dir };
+            storage.bubblewrap = .{
+                .workspace_dir = workspace_dir,
+                .allowed_paths = allowed_paths,
+                .writable_paths = writable_paths,
+            };
             if (storage.bubblewrap.sandbox().isAvailable()) {
                 return storage.bubblewrap.sandbox();
             }
@@ -64,7 +72,7 @@ pub fn createSandbox(
             return storage.docker.sandbox();
         },
         .auto => {
-            return detectBest(allocator, workspace_dir, storage);
+            return detectBest(allocator, workspace_dir, storage, allowed_paths, writable_paths);
         },
     }
 }
@@ -79,7 +87,13 @@ pub const SandboxStorage = struct {
 };
 
 /// Auto-detect the best available sandbox backend.
-fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: *SandboxStorage) Sandbox {
+fn detectBest(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    storage: *SandboxStorage,
+    allowed_paths: []const []const u8,
+    writable_paths: []const []const u8,
+) Sandbox {
     if (comptime builtin.os.tag == .linux) {
         // Keep landlock hidden from auto mode until rule installation exists.
         storage.landlock = .{ .workspace_dir = workspace_dir };
@@ -94,7 +108,11 @@ fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: 
         }
 
         // Try Bubblewrap second
-        storage.bubblewrap = .{ .workspace_dir = workspace_dir };
+        storage.bubblewrap = .{
+            .workspace_dir = workspace_dir,
+            .allowed_paths = allowed_paths,
+            .writable_paths = writable_paths,
+        };
         if (storage.bubblewrap.sandbox().isAvailable()) {
             return storage.bubblewrap.sandbox();
         }
@@ -159,20 +177,20 @@ test "detect available returns struct" {
 
 test "create sandbox with none returns noop" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(std.testing.allocator, .none, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .none, "/tmp/workspace", &storage, &.{}, &.{});
     try std.testing.expectEqualStrings("none", sb.name());
     try std.testing.expect(sb.isAvailable());
 }
 
 test "create sandbox with landlock falls back to noop until implemented" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(std.testing.allocator, .landlock, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .landlock, "/tmp/workspace", &storage, &.{}, &.{});
     try std.testing.expectEqualStrings("none", sb.name());
 }
 
 test "create sandbox with auto returns something" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage, &.{}, &.{});
     // Should always return at least some sandbox
     try std.testing.expect(sb.name().len > 0);
     try std.testing.expect(!std.mem.eql(u8, sb.name(), "landlock"));
@@ -180,7 +198,7 @@ test "create sandbox with auto returns something" {
 
 test "create sandbox with docker returns docker" {
     var storage: SandboxStorage = .{};
-    const sb = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage);
+    const sb = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage, &.{}, &.{});
     try std.testing.expectEqualStrings("docker", sb.name());
 }
 

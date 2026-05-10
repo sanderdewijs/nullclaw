@@ -1251,6 +1251,7 @@ pub const ChannelRuntime = struct {
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
             .allowed_paths = config.autonomy.allowed_paths,
+            .writable_paths = config.autonomy.writable_paths,
             .policy = security_policy,
             .subagent_manager = subagent_manager,
             .bootstrap_provider = bootstrap_provider,

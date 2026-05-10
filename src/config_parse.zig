@@ -1163,6 +1163,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("writable_paths")) |v| {
+                if (v == .array) self.autonomy.writable_paths = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
