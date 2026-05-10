@@ -3513,16 +3513,19 @@ fn handleWhatsAppWebWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (msg_text) |mt| {
         const reply_to = reply_to_raw;
         const wa_sender = sender orelse "unknown";
-        const session_key = reply_to orelse wa_sender;
+        // Use stable phone-based sender as session key (not reply_to JID which
+        // can flip between phone and LID format across reconnects).
+        const session_key = wa_sender;
         const wa_peer_kind = if (is_group) "group" else "direct";
         const wa_peer_id = group_id orelse wa_sender;
 
         if (ctx.state.event_bus) |eb| {
-            var meta_buf: [384]u8 = undefined;
-            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+            var meta_buf: [512]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"reply_jid\":\"{s}\"}}", .{
                 waw_account_id,
                 wa_peer_kind,
                 wa_peer_id,
+                reply_to orelse wa_sender,
             }) catch null;
             _ = publishToBus(eb, ctx.state.allocator, "whatsapp_web", wa_sender, reply_to orelse wa_sender, mt, session_key, meta);
             ctx.response_body = "{\"status\":\"received\"}";
@@ -5385,6 +5388,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
+                    .writable_paths = cfg.autonomy.writable_paths,
                     .tools_config = cfg.tools,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
