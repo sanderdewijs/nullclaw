@@ -2453,16 +2453,38 @@ pub fn scaffoldWorkspace(
     ctx: *const ProjectContext,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !void {
-    if (std.fs.path.dirname(workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+    // Create the full directory chain (e.g. .nullclaw/agents/{id}/workspace).
+    // makeDirAbsolute only creates the final component, so walk up to find
+    // the first existing ancestor, then create missing directories top-down.
+    {
+        var ancestors: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (ancestors.items) |a| allocator.free(a);
+            ancestors.deinit(allocator);
+        }
+        // Collect missing ancestor directories
+        var cur: []const u8 = workspace_dir;
+        while (true) {
+            std.fs.makeDirAbsolute(cur) catch |err| switch (err) {
+                error.PathAlreadyExists => break,
+                else => {
+                    ancestors.append(allocator, allocator.dupe(u8, cur) catch return err) catch return err;
+                    cur = std.fs.path.dirname(cur) orelse break;
+                    continue;
+                },
+            };
+            break;
+        }
+        // Create ancestors in reverse order (top-down)
+        var i = ancestors.items.len;
+        while (i > 0) {
+            i -= 1;
+            std.fs.makeDirAbsolute(ancestors.items[i]) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
     }
-    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
 
     const had_legacy_user_content = try hasLegacyUserContentIndicators(allocator, workspace_dir);
 
