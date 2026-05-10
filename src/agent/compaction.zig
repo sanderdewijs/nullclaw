@@ -32,6 +32,10 @@ const MAX_WORKSPACE_CONTEXT_CHARS: usize = 2_000;
 /// Maximum AGENTS.md bytes read for critical rules extraction.
 const MAX_AGENTS_FILE_BYTES: usize = 2 * 1024 * 1024;
 
+/// Cap on attachment-marker bytes pinned through compaction. Prevents a
+/// pathological message with hundreds of attachments from blowing the summary.
+const MAX_PINNED_ATTACHMENTS_CHARS: usize = 4096;
+
 /// Default: max characters in source transcript passed to the summarizer.
 pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 12_000;
 
@@ -141,8 +145,21 @@ pub fn autoCompactHistory(
         try allocator.dupe(u8, summary);
     defer allocator.free(summary_with_context);
 
-    // Create the compaction summary message
-    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
+    // Pin attachment markers from messages being compacted so concrete file
+    // paths survive summarization. The LLM summary may otherwise drop them,
+    // leaving the agent unable to reference saved attachments after compaction.
+    const pinned_attachments = try extractAttachmentMarkers(allocator, history.items, start, compact_end);
+    defer allocator.free(pinned_attachments);
+
+    // Create the compaction summary message; append pinned attachments if present.
+    const summary_content = if (pinned_attachments.len > 0)
+        try std.fmt.allocPrint(
+            allocator,
+            "[Compaction summary]\n{s}\n\n[ATTACHMENTS_PINNED]\n{s}\n[/ATTACHMENTS_PINNED]",
+            .{ summary_with_context, pinned_attachments },
+        )
+    else
+        try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
 
     // Free old messages being compacted
     for (history.items[start..compact_end]) |*msg| {
@@ -263,6 +280,45 @@ fn buildCompactionTranscript(
 
     if (buf.items.len > max_source_chars) {
         buf.items.len = max_source_chars;
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Extract `[ATTACHMENTS]...[/ATTACHMENTS]` blocks from messages being compacted.
+/// Concatenates the inner content of every block (newline-separated) so that
+/// concrete file paths survive summarization. Capped at MAX_PINNED_ATTACHMENTS_CHARS.
+fn extractAttachmentMarkers(
+    allocator: std.mem.Allocator,
+    history_items: []const OwnedMessage,
+    start: usize,
+    end: usize,
+) ![]u8 {
+    const open_marker = "[ATTACHMENTS]";
+    const close_marker = "[/ATTACHMENTS]";
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    for (history_items[start..end]) |*msg| {
+        var search: []const u8 = msg.content;
+        while (std.mem.indexOf(u8, search, open_marker)) |open_idx| {
+            const after_open = open_idx + open_marker.len;
+            const remainder = search[after_open..];
+            const close_rel = std.mem.indexOf(u8, remainder, close_marker) orelse break;
+
+            const inner = std.mem.trim(u8, remainder[0..close_rel], " \n\t\r");
+            if (inner.len > 0) {
+                if (buf.items.len > 0) try buf.append(allocator, '\n');
+                try buf.appendSlice(allocator, inner);
+                if (buf.items.len >= MAX_PINNED_ATTACHMENTS_CHARS) {
+                    buf.items.len = MAX_PINNED_ATTACHMENTS_CHARS;
+                    return buf.toOwnedSlice(allocator);
+                }
+            }
+
+            search = remainder[close_rel + close_marker.len ..];
+        }
     }
 
     return buf.toOwnedSlice(allocator);
@@ -780,6 +836,55 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     defer std.testing.allocator.free(context);
 
     try std.testing.expectEqual(@as(usize, 0), context.len);
+}
+
+test "extractAttachmentMarkers preserves attachment paths from compacted messages" {
+    const allocator = std.testing.allocator;
+
+    const items = [_]OwnedMessage{
+        .{ .role = .user, .content = "Hi there" },
+        .{ .role = .user, .content = "[UNTRUSTED_EMAIL_START]\nFrom: foo@bar\nSubject: Factuur\n\nLook at this.\n\n[ATTACHMENTS]\n- factuur.pdf (saved to: /tmp/123_factuur.pdf)\n[/ATTACHMENTS]\n[UNTRUSTED_EMAIL_END]" },
+        .{ .role = .assistant, .content = "OK, I see it" },
+    };
+
+    const pinned = try extractAttachmentMarkers(allocator, &items, 0, items.len);
+    defer allocator.free(pinned);
+
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "factuur.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "/tmp/123_factuur.pdf") != null);
+    // Inner content only — the markers themselves are stripped.
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "[ATTACHMENTS]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "[/ATTACHMENTS]") == null);
+}
+
+test "extractAttachmentMarkers concatenates multiple blocks across messages" {
+    const allocator = std.testing.allocator;
+
+    const items = [_]OwnedMessage{
+        .{ .role = .user, .content = "[ATTACHMENTS]\n- a.pdf (saved to: /tmp/a.pdf)\n[/ATTACHMENTS]" },
+        .{ .role = .user, .content = "no attachments here" },
+        .{ .role = .user, .content = "[ATTACHMENTS]\n- b.pdf (saved to: /tmp/b.pdf)\n[/ATTACHMENTS]" },
+    };
+
+    const pinned = try extractAttachmentMarkers(allocator, &items, 0, items.len);
+    defer allocator.free(pinned);
+
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "/tmp/a.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "/tmp/b.pdf") != null);
+}
+
+test "extractAttachmentMarkers returns empty slice when no markers present" {
+    const allocator = std.testing.allocator;
+
+    const items = [_]OwnedMessage{
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .content = "world" },
+    };
+
+    const pinned = try extractAttachmentMarkers(allocator, &items, 0, items.len);
+    defer allocator.free(pinned);
+
+    try std.testing.expectEqual(@as(usize, 0), pinned.len);
 }
 
 test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
