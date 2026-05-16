@@ -2368,11 +2368,20 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const codex = yc.providers.openai_codex;
     const auth_mod = yc.auth;
 
-    if (!std.mem.eql(u8, provider_name, "openai-codex")) {
+    const is_openai_codex = std.mem.eql(u8, provider_name, "openai-codex");
+    const is_xai = std.mem.eql(u8, provider_name, "xai");
+
+    if (!is_openai_codex and !is_xai) {
         std.debug.print("Unknown auth provider: {s}\n\n", .{provider_name});
         std.debug.print("Available providers:\n", .{});
         std.debug.print("  openai-codex    ChatGPT Plus/Pro subscription (OAuth)\n", .{});
+        std.debug.print("  xai             Grok / SuperGrok subscription (OAuth)\n", .{});
         std.process.exit(1);
+    }
+
+    if (is_xai) {
+        runXaiAuth(allocator, subcmd, auth_mod);
+        return;
     }
 
     if (std.mem.eql(u8, subcmd, "login")) {
@@ -2462,14 +2471,109 @@ fn printAuthUsage() void {
         \\
         \\Providers:
         \\  openai-codex    ChatGPT Plus/Pro subscription (OAuth)
+        \\  xai             Grok / SuperGrok subscription (OAuth)
         \\
         \\Examples:
+        \\  nullclaw auth login xai
+        \\  nullclaw auth status xai
+        \\  nullclaw auth logout xai
         \\  nullclaw auth login openai-codex
         \\  nullclaw auth login openai-codex --import-codex
-        \\  nullclaw auth status openai-codex
-        \\  nullclaw auth logout openai-codex
         \\
     , .{AUTH_SUBCOMMANDS}), .{});
+}
+
+fn runXaiAuth(
+    allocator: std.mem.Allocator,
+    subcmd: []const u8,
+    auth_mod: type,
+) void {
+    const xai = yc.providers.xai_oauth;
+
+    if (std.mem.eql(u8, subcmd, "login")) {
+        std.debug.print("Starting xAI Grok authentication...\n\n", .{});
+
+        const dc = auth_mod.startDeviceCodeFlow(
+            allocator,
+            xai.OAUTH_CLIENT_ID,
+            xai.OAUTH_DEVICE_URL,
+            xai.OAUTH_SCOPE,
+        ) catch {
+            std.debug.print("Failed to start device code flow.\n", .{});
+            std.debug.print("Check your internet connection or try again later.\n", .{});
+            std.process.exit(1);
+        };
+        defer dc.deinit(allocator);
+
+        std.debug.print("Open this URL in your browser:\n", .{});
+        std.debug.print("  {s}\n\n", .{dc.verification_uri});
+        std.debug.print("Enter code: {s}\n\n", .{dc.user_code});
+        std.debug.print("Waiting for authorization (timeout: {d}s)...\n", .{dc.expires_in});
+
+        const token = auth_mod.pollDeviceCode(
+            allocator,
+            xai.OAUTH_TOKEN_URL,
+            xai.OAUTH_CLIENT_ID,
+            dc.device_code,
+            dc.interval,
+        ) catch |err| {
+            switch (err) {
+                error.DeviceCodeDenied => std.debug.print("Authorization denied.\n", .{}),
+                error.DeviceCodeTimeout => std.debug.print("Authorization timed out.\n", .{}),
+                else => std.debug.print("Authorization failed: {}\n", .{err}),
+            }
+            std.process.exit(1);
+        };
+        defer token.deinit(allocator);
+
+        auth_mod.saveCredential(allocator, xai.CREDENTIAL_KEY, token) catch {
+            std.debug.print("Failed to save credential.\n", .{});
+            std.process.exit(1);
+        };
+
+        std.debug.print("Authenticated successfully.\n", .{});
+        if (token.refresh_token != null) {
+            std.debug.print("  Refresh token: present\n", .{});
+        }
+        std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"xai/grok-4\" in ~/.nullclaw/config.json\n", .{});
+    } else if (std.mem.eql(u8, subcmd, "status")) {
+        if (auth_mod.loadCredential(allocator, xai.CREDENTIAL_KEY) catch null) |token| {
+            defer token.deinit(allocator);
+            std.debug.print("xai: authenticated\n", .{});
+            if (token.expires_at != 0) {
+                const remaining = token.expires_at - std.time.timestamp();
+                if (remaining > 0) {
+                    std.debug.print("  Token expires in: {d}h {d}m\n", .{
+                        @divTrunc(remaining, 3600),
+                        @divTrunc(@mod(remaining, 3600), 60),
+                    });
+                } else {
+                    std.debug.print("  Token: expired", .{});
+                    if (token.refresh_token != null) {
+                        std.debug.print(" (will auto-refresh)\n", .{});
+                    } else {
+                        std.debug.print(" (re-run auth login xai)\n", .{});
+                    }
+                }
+            }
+            if (token.refresh_token != null) {
+                std.debug.print("  Refresh token: present\n", .{});
+            }
+        } else {
+            std.debug.print("xai: not authenticated\n", .{});
+            std.debug.print("  Run `nullclaw auth login xai` to authenticate.\n", .{});
+        }
+    } else if (std.mem.eql(u8, subcmd, "logout")) {
+        if (auth_mod.deleteCredential(allocator, xai.CREDENTIAL_KEY) catch false) {
+            std.debug.print("xai: credentials removed.\n", .{});
+        } else {
+            std.debug.print("xai: no credentials found.\n", .{});
+        }
+    } else {
+        std.debug.print("Unknown auth command: {s}\n\n", .{subcmd});
+        printAuthUsage();
+        std.process.exit(1);
+    }
 }
 
 fn runAuthDeviceCodeLogin(

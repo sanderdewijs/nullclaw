@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("../config_types.zig");
+const xai_oauth = @import("xai_oauth.zig");
 
 /// Resolve API key for a provider from config and environment variables.
 ///
@@ -53,6 +54,16 @@ pub fn resolveApiKey(
             }
             allocator.free(value);
         } else |_| {}
+    }
+
+    // 4. xAI/Grok: fall back to stored OAuth credential (SuperGrok subscription).
+    //    Automatically refreshes an expired token when a refresh_token is present.
+    const is_xai = std.mem.eql(u8, provider_name, "xai") or
+        std.mem.eql(u8, provider_name, "grok");
+    if (is_xai) {
+        if (try xai_oauth.resolveToken(allocator)) |token| {
+            return token;
+        }
     }
 
     return null;
